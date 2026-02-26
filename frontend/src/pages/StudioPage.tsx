@@ -866,6 +866,9 @@ export function StudioPage() {
     setComposerText('');
     setComposerReferences([]);
     setAnnotationContext(null);
+    // 发送即退出标注模式，回到消息流视图
+    setAnnotatorAsset(null);
+    setLightboxAsset(null);
 
     try {
       const result = await studioApi.createTurn(targetWorkspaceId, {
