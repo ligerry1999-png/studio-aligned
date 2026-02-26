@@ -801,11 +801,11 @@ export function ComposerDock({
     <Box
       ref={dockRootRef}
       sx={{ 
-        position: 'fixed',
-        bottom: 24,
+        position: 'absolute',
+        bottom: 14,
         left: '50%',
         transform: 'translateX(-50%)',
-        width: 'min(800px, calc(100% - 120px))',
+        width: 'min(800px, calc(100% - 24px))',
         zIndex: annotationActive ? 180 : 100,
       }}
     >

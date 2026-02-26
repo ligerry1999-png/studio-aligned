@@ -1122,54 +1122,55 @@ export function StudioPage() {
                 </Typography>
               </Box>
               
-              {/* Chat Thread - with bottom padding for floating composer */}
-              <Box sx={{ flex: 1, minHeight: 0, pb: '200px' }}>
-                <ChatThread
-                  workspace={displayWorkspace}
-                  onOpenAsset={(asset) => setLightboxAsset(asset)}
-                  onImageAction={(action, asset) => {
-                    void handleImageAction(action, asset);
+              {/* Workspace Content + Floating Composer */}
+              <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
+                <Box sx={{ height: '100%', minHeight: 0, pb: { xs: '20px', md: '16px' } }}>
+                  <ChatThread
+                    workspace={displayWorkspace}
+                    onOpenAsset={(asset) => setLightboxAsset(asset)}
+                    onImageAction={(action, asset) => {
+                      void handleImageAction(action, asset);
+                    }}
+                  />
+                </Box>
+
+                <ComposerDock
+                  workspaceId={currentWorkspace?.id || null}
+                  text={composerText}
+                  references={composerReferences}
+                  params={params}
+                  options={options}
+                  annotationActive={Boolean(annotatorAsset)}
+                  sendDisabled={annotationSendGuard.disabled}
+                  uploadAssets={uploadSourceAssets}
+                  generatedAssets={generatedAssets}
+                  savedAssets={savedAssets}
+                  mentionSettings={mentionSettings}
+                  officialAssets={officialAssets}
+                  officialHasMore={officialHasMore}
+                  officialLoading={officialLoading}
+                  officialFilters={officialFilters}
+                  onOfficialFilterChange={(patch) => setOfficialFilters((prev) => ({ ...prev, ...patch }))}
+                  onOfficialReload={() => {
+                    void refreshOfficialMetaAndFirstPage();
+                  }}
+                  onOfficialLoadMore={() => {
+                    void loadOfficialAssets(false, officialFilters);
+                  }}
+                  insertAssetRequest={insertAssetRequest}
+                  sending={isCurrentWorkspaceSending}
+                  onTextChange={setComposerText}
+                  onReferencesChange={setComposerReferences}
+                  onParamsChange={(patch) => setParams((prev) => ({ ...prev, ...patch }))}
+                  onUploadFiles={handleUploadFiles}
+                  onConsumeInsertAssetRequest={() => setInsertAssetRequest(null)}
+                  onAnnotateReference={handleAnnotateReference}
+                  onSend={() => {
+                    void handleSendTurn();
                   }}
                 />
               </Box>
             </Box>
-            
-            {/* Floating Composer Dock */}
-            <ComposerDock
-              workspaceId={currentWorkspace?.id || null}
-              text={composerText}
-              references={composerReferences}
-              params={params}
-              options={options}
-              annotationActive={Boolean(annotatorAsset)}
-              sendDisabled={annotationSendGuard.disabled}
-              uploadAssets={uploadSourceAssets}
-              generatedAssets={generatedAssets}
-              savedAssets={savedAssets}
-              mentionSettings={mentionSettings}
-              officialAssets={officialAssets}
-              officialHasMore={officialHasMore}
-              officialLoading={officialLoading}
-              officialFilters={officialFilters}
-              onOfficialFilterChange={(patch) => setOfficialFilters((prev) => ({ ...prev, ...patch }))}
-              onOfficialReload={() => {
-                void refreshOfficialMetaAndFirstPage();
-              }}
-              onOfficialLoadMore={() => {
-                void loadOfficialAssets(false, officialFilters);
-              }}
-              insertAssetRequest={insertAssetRequest}
-              sending={isCurrentWorkspaceSending}
-              onTextChange={setComposerText}
-              onReferencesChange={setComposerReferences}
-              onParamsChange={(patch) => setParams((prev) => ({ ...prev, ...patch }))}
-              onUploadFiles={handleUploadFiles}
-              onConsumeInsertAssetRequest={() => setInsertAssetRequest(null)}
-              onAnnotateReference={handleAnnotateReference}
-              onSend={() => {
-                void handleSendTurn();
-              }}
-            />
           </Box>
         )}
       </Box>

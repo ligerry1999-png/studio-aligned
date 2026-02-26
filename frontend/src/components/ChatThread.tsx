@@ -271,8 +271,8 @@ function TaskCard({
                     {isDeletedAsset(asset) ? (
                       <Box
                         sx={{
-                          width: { xs: 220, sm: 260 },
-                          minHeight: 180,
+                          width: { xs: 165, sm: 195 },
+                          minHeight: 135,
                           bgcolor: 'action.hover',
                           border: '1px dashed',
                           borderColor: 'divider',
@@ -295,9 +295,9 @@ function TaskCard({
                           sx={{
                             display: 'block',
                             width: 'auto',
-                            maxWidth: { xs: 'calc(100vw - 106px)', sm: 280, md: 320 },
+                            maxWidth: { xs: 'calc(100vw - 150px)', sm: 210, md: 240 },
                             height: 'auto',
-                            maxHeight: { xs: 340, md: 430 },
+                            maxHeight: { xs: 255, md: 322 },
                             objectFit: 'contain',
                             cursor: 'pointer',
                             borderRadius: 1.4,

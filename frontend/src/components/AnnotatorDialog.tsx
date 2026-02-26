@@ -191,6 +191,7 @@ export function AnnotatorDialog({
   const lastContextSignatureRef = useRef('');
   const [activeTool, setActiveTool] = useState<AnnotateTool>('rectangle');
   const [hint, setHint] = useState('');
+  const [imageRatio, setImageRatio] = useState(3 / 4);
 
   const snapshot = useMemo(() => {
     const raw = asset?.annotation_snapshot;
@@ -287,7 +288,33 @@ export function AnnotatorDialog({
     if (cleanupRef.current) cleanupRef.current();
   }, []);
 
+  useEffect(() => {
+    if (!open || !asset) return;
+    const src = resolveAssetUrl(asset.file_url || asset.thumbnail_url);
+    if (!src) return;
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      const w = img.naturalWidth || 0;
+      const h = img.naturalHeight || 0;
+      if (w > 0 && h > 0) {
+        setImageRatio(w / h);
+      }
+    };
+    img.src = src;
+    return () => {
+      cancelled = true;
+    };
+  }, [open, asset]);
+
   if (!open || !asset) return null;
+
+  const normalizedRatio = Number.isFinite(imageRatio) && imageRatio > 0
+    ? Math.max(0.35, Math.min(imageRatio, 3.2))
+    : 3 / 4;
+  const frameWidth = `min(calc((100vh - 220px) * ${normalizedRatio}), calc(100vw - 120px))`;
+  const frameHeight = `min(calc((100vw - 120px) / ${normalizedRatio}), calc(100vh - 220px))`;
 
   return (
     <Box
@@ -319,14 +346,14 @@ export function AnnotatorDialog({
           left: '50%',
           top: 'calc(50% - 52px)',
           transform: 'translate(-50%, -50%)',
-          width: 'min(980px, calc(100vw - 120px))',
-          height: 'min(72vh, calc(100vh - 220px))',
-          minHeight: 340,
+          width: frameWidth,
+          height: frameHeight,
+          minHeight: 260,
           borderRadius: 2,
           overflow: 'hidden',
-          border: '1px solid rgba(255,255,255,0.2)',
-          bgcolor: '#111',
-          boxShadow: '0 24px 56px rgba(0,0,0,0.36)',
+          border: '1px solid rgba(255,255,255,0.26)',
+          bgcolor: 'transparent',
+          boxShadow: '0 24px 56px rgba(0,0,0,0.24)',
           pointerEvents: 'auto',
         }}
       >
@@ -417,7 +444,7 @@ export function AnnotatorDialog({
             inset: 0,
             width: '100%',
             height: '100%',
-            objectFit: 'contain',
+            objectFit: 'fill',
             pointerEvents: 'none',
           }}
         />

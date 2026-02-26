@@ -41,6 +41,7 @@ export function WorkspaceSidebar({
   onOpenSettings,
 }: WorkspaceSidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
+  const sessionList = Array.isArray(sessions) ? sessions : [];
 
   return (
     <Box
@@ -90,7 +91,7 @@ export function WorkspaceSidebar({
       {/* Sessions List */}
       <Box sx={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
         <Stack spacing={0.5}>
-          {sessions.map((session) => {
+          {sessionList.map((session) => {
             const active = session.id === currentWorkspaceId;
             return (
               <Tooltip

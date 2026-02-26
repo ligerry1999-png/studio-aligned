@@ -29,7 +29,7 @@ export const useStudioStore = create<StudioStoreState>((set) => ({
   sessions: [],
   currentWorkspace: null,
   setOptions: (options) => set({ options }),
-  setSessions: (sessions) => set({ sessions }),
+  setSessions: (sessions) => set({ sessions: Array.isArray(sessions) ? sessions : [] }),
   setCurrentWorkspace: (workspace) => set({ currentWorkspace: workspace }),
   appendTurn: (userMessage, assistantMessage) =>
     set((state) => {

@@ -16,9 +16,9 @@ import type {
   WorkspaceSummary,
 } from '../types/studio';
 
-const API_BASE = String(import.meta.env.VITE_API_BASE_URL || '')
-  .trim()
-  .replace(/\/$/, '');
+const RAW_API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').trim();
+const DEFAULT_API_BASE = import.meta.env.DEV ? 'http://127.0.0.1:8899' : '';
+const API_BASE = (RAW_API_BASE || DEFAULT_API_BASE).replace(/\/$/, '');
 const BROWSER_ORIGIN = typeof window !== 'undefined' ? window.location.origin.replace(/\/$/, '') : '';
 
 function buildUrl(path: string): string {
@@ -101,8 +101,12 @@ export const studioApi = {
       body: formData,
     });
   },
-  listWorkspaces(): Promise<WorkspaceSummary[]> {
-    return requestJson<WorkspaceSummary[]>('/api/v1/workspaces');
+  async listWorkspaces(): Promise<WorkspaceSummary[]> {
+    const payload = await requestJson<unknown>('/api/v1/workspaces');
+    if (!Array.isArray(payload)) {
+      throw new Error('工作区列表响应格式异常，请检查 API 地址配置');
+    }
+    return payload as WorkspaceSummary[];
   },
   createWorkspace(name: string): Promise<WorkspaceDetail> {
     return requestJson<WorkspaceDetail>('/api/v1/workspaces', {
