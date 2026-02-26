@@ -1,0 +1,26 @@
+name: studio-aligned
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: studio-aligned-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8899}:8899"
+    volumes:
+      - ./runtime_data:/app/data
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    container_name: studio-aligned-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5174}:80"

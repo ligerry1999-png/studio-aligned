@@ -1,0 +1,92 @@
+name: Deploy Studio Aligned
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+      RUNTIME_ENV: ${{ secrets.RUNTIME_ENV }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Required Secrets
+        run: |
+          set -euo pipefail
+          for key in SERVER_HOST SERVER_PORT SERVER_USER DEPLOY_PATH DEPLOY_KEY RUNTIME_ENV; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required secret: $key"
+              exit 1
+            fi
+          done
+
+      - name: Setup SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SERVER_PORT" "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare Target Directory
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+            "mkdir -p '$DEPLOY_PATH' '$DEPLOY_PATH/runtime_data'"
+
+      - name: Sync Project Files
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.DS_Store' \
+            --exclude 'frontend/node_modules/' \
+            --exclude 'frontend/dist/' \
+            --exclude 'backend/.venv/' \
+            --exclude 'backend/data/' \
+            --exclude 'runtime_data/' \
+            -e "ssh -i ~/.ssh/deploy_key -p $SERVER_PORT" \
+            ./ "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/"
+
+      - name: Upload Runtime Env
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RUNTIME_ENV" > .runtime_env
+          scp -i ~/.ssh/deploy_key -P "$SERVER_PORT" .runtime_env "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/.env"
+          rm -f .runtime_env
+
+      - name: Deploy With Docker Compose
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" bash -s -- "$DEPLOY_PATH" <<'SSH'
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          mkdir -p runtime_data
+          docker compose up -d --build --remove-orphans
+          docker compose ps
+          SSH
+
+      - name: Health Check
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" bash -s -- "$DEPLOY_PATH" <<'SSH'
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          BACKEND_PORT="$(grep -E '^BACKEND_PORT=' .env | tail -n1 | cut -d= -f2 || true)"
+          BACKEND_PORT="${BACKEND_PORT:-8899}"
+          curl -fsS "http://127.0.0.1:${BACKEND_PORT}/healthz" >/dev/null
+          echo "Health check passed on ${BACKEND_PORT}"
+          SSH
