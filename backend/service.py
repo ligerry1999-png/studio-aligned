@@ -593,8 +593,10 @@ class StudioService:
         normalized = _normalize_runtime_config(loaded)
         if loaded != normalized:
             _write_json(RUNTIME_CONFIG_FILE, normalized)
-        if _runtime_http_api_key_from_env():
+        env_managed = bool(_runtime_http_api_key_from_env())
+        if env_managed:
             normalized["http"]["api_key"] = ""
+        normalized["http"]["api_key_managed_by_env"] = env_managed
         return normalized
 
     def update_runtime_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:

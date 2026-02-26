@@ -16,16 +16,22 @@ import type {
   WorkspaceSummary,
 } from '../types/studio';
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8899').replace(/\/$/, '');
+const API_BASE = String(import.meta.env.VITE_API_BASE_URL || '')
+  .trim()
+  .replace(/\/$/, '');
+const BROWSER_ORIGIN = typeof window !== 'undefined' ? window.location.origin.replace(/\/$/, '') : '';
 
 function buildUrl(path: string): string {
   if (path.startsWith('http://') || path.startsWith('https://')) {
     return path;
   }
   if (path.startsWith('/')) {
-    return `${API_BASE}${path}`;
+    return API_BASE ? `${API_BASE}${path}` : path;
   }
-  return `${API_BASE}/${path}`;
+  if (API_BASE) {
+    return `${API_BASE}/${path}`;
+  }
+  return `/${path.replace(/^\/+/, '')}`;
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -50,12 +56,16 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 export function resolveAssetUrl(raw?: string): string {
   if (!raw) return '';
   if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
-  if (raw.startsWith('/')) return `${API_BASE}${raw}`;
-  return `${API_BASE}/${raw}`;
+  if (raw.startsWith('/')) {
+    if (API_BASE) return `${API_BASE}${raw}`;
+    return BROWSER_ORIGIN ? `${BROWSER_ORIGIN}${raw}` : raw;
+  }
+  if (API_BASE) return `${API_BASE}/${raw}`;
+  return BROWSER_ORIGIN ? `${BROWSER_ORIGIN}/${raw.replace(/^\/+/, '')}` : raw;
 }
 
 export function getApiBase(): string {
-  return API_BASE;
+  return API_BASE || BROWSER_ORIGIN || '';
 }
 
 export const studioApi = {

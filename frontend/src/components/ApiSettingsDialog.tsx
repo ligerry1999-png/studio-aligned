@@ -59,6 +59,7 @@ const DEFAULT_API_CONFIG: RuntimeConfig = {
   http: {
     endpoint: '',
     api_key: '',
+    api_key_managed_by_env: false,
     response_format: 'url',
     timeout_seconds: 120,
     download_dir: '',
@@ -91,6 +92,7 @@ function normalizeRuntime(input: RuntimeConfig): RuntimeConfig {
     http: {
       endpoint: input.http.endpoint.trim(),
       api_key: input.http.api_key || '',
+      api_key_managed_by_env: Boolean(input.http.api_key_managed_by_env),
       response_format: input.http.response_format === 'b64_json' ? 'b64_json' : 'url',
       timeout_seconds: Math.max(5, Math.min(Math.round(timeout), 600)),
       download_dir: String(input.http.download_dir || '').trim(),
@@ -247,6 +249,7 @@ export function ApiSettingsDialog({
       return text.includes(q);
     });
   }, [activeSourceId, dynamicSourceAssets.generated, dynamicSourceAssets.saved, dynamicSourceAssets.upload, dynamicSourceQuery]);
+  const apiKeyManagedByEnv = Boolean(apiDraft.http.api_key_managed_by_env);
 
   function resetDrafts() {
     const nextMention = normalizeMention(mentionSettings || DEFAULT_MENTION_SETTINGS);
@@ -271,6 +274,9 @@ export function ApiSettingsDialog({
 
   async function submitApi() {
     const normalized = normalizeRuntime(apiDraft);
+    if (normalized.http.api_key_managed_by_env) {
+      normalized.http.api_key = '';
+    }
     if (!normalized.http.endpoint) {
       setApiError('请填写小豆包 API 地址。');
       return;
@@ -592,19 +598,23 @@ export function ApiSettingsDialog({
               fullWidth
             />
 
-            <TextField
-              label="API Key"
-              type="password"
-              value={apiDraft.http.api_key}
-              onChange={(event) =>
-                setApiDraft((prev) => ({
-                  ...prev,
-                  http: { ...prev.http, api_key: event.target.value },
-                }))
-              }
-              size="small"
-              fullWidth
-            />
+            {apiKeyManagedByEnv ? (
+              <Alert severity="info">API Key 已由服务器环境变量托管，前端设置中已隐藏。</Alert>
+            ) : (
+              <TextField
+                label="API Key"
+                type="password"
+                value={apiDraft.http.api_key}
+                onChange={(event) =>
+                  setApiDraft((prev) => ({
+                    ...prev,
+                    http: { ...prev.http, api_key: event.target.value },
+                  }))
+                }
+                size="small"
+                fullWidth
+              />
+            )}
 
             <TextField
               select

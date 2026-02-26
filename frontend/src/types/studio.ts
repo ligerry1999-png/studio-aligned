@@ -13,6 +13,7 @@ export interface StudioOptions {
 export interface RuntimeHttpConfig {
   endpoint: string;
   api_key: string;
+  api_key_managed_by_env?: boolean;
   response_format: 'url' | 'b64_json';
   timeout_seconds: number;
   download_dir: string;
