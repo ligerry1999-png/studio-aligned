@@ -70,7 +70,10 @@ VITE_API_BASE_URL=http://127.0.0.1:8899
 BACKEND_PORT=8899
 FRONTEND_PORT=5174
 VITE_API_BASE_URL=
+STUDIO_HTTP_API_KEY=sk-xxxx
 ```
+
+说明：当 `STUDIO_HTTP_API_KEY` 存在时，后端会优先使用该值，且设置接口不会返回明文 key。
 
 ### 2) 触发部署
 

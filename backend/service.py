@@ -2,6 +2,7 @@ import base64
 import concurrent.futures
 import io
 import json
+import os
 import random
 import re
 import shutil
@@ -102,6 +103,14 @@ DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
         "download_dir": "",
     },
 }
+
+
+def _runtime_http_api_key_from_env() -> str:
+    for name in ("STUDIO_HTTP_API_KEY", "XIAODOUBAO_API_KEY", "HTTP_API_KEY"):
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _now_iso() -> str:
@@ -584,10 +593,14 @@ class StudioService:
         normalized = _normalize_runtime_config(loaded)
         if loaded != normalized:
             _write_json(RUNTIME_CONFIG_FILE, normalized)
+        if _runtime_http_api_key_from_env():
+            normalized["http"]["api_key"] = ""
         return normalized
 
     def update_runtime_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized = _normalize_runtime_config(payload)
+        if _runtime_http_api_key_from_env():
+            normalized["http"]["api_key"] = ""
         _write_json(RUNTIME_CONFIG_FILE, normalized)
         return normalized
 
@@ -1499,7 +1512,7 @@ class StudioService:
             raise HTTPException(status_code=400, detail="请先在设置中填写小豆包 API 地址。")
 
         timeout_seconds = max(5, min(int(http_cfg.get("timeout_seconds") or 120), 600))
-        api_key = str(http_cfg.get("api_key") or "")
+        api_key = _runtime_http_api_key_from_env() or str(http_cfg.get("api_key") or "")
         ratio = _normalize_aspect_ratio(params.get("aspect_ratio", "3:4"))
         image_size = _normalize_quality(params.get("quality", "2K"))
         model = self._resolve_xiaodoubao_model(image_size, str(params.get("model", "")))
