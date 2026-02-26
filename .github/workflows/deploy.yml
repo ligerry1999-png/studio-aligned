@@ -15,6 +15,7 @@ jobs:
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
       DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
       RUNTIME_ENV: ${{ secrets.RUNTIME_ENV }}
+      STUDIO_HTTP_API_KEY: ${{ secrets.STUDIO_HTTP_API_KEY }}
 
     steps:
       - name: Checkout
@@ -23,7 +24,7 @@ jobs:
       - name: Validate Required Secrets
         run: |
           set -euo pipefail
-          for key in SERVER_HOST SERVER_PORT SERVER_USER DEPLOY_PATH DEPLOY_KEY RUNTIME_ENV; do
+          for key in SERVER_HOST SERVER_PORT SERVER_USER DEPLOY_PATH DEPLOY_KEY RUNTIME_ENV STUDIO_HTTP_API_KEY; do
             if [ -z "${!key:-}" ]; then
               echo "::error::Missing required secret: $key"
               exit 1
@@ -63,6 +64,9 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' "$RUNTIME_ENV" > .runtime_env
+          grep -v '^STUDIO_HTTP_API_KEY=' .runtime_env > .runtime_env.cleaned || true
+          mv .runtime_env.cleaned .runtime_env
+          printf 'STUDIO_HTTP_API_KEY=%s\n' "$STUDIO_HTTP_API_KEY" >> .runtime_env
           scp -i ~/.ssh/deploy_key -P "$SERVER_PORT" .runtime_env "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/.env"
           rm -f .runtime_env
 

@@ -63,6 +63,7 @@ VITE_API_BASE_URL=http://127.0.0.1:8899
 - `DEPLOY_PATH`：服务器部署目录（如 `/opt/studio_aligned`）
 - `DEPLOY_KEY`：私钥内容（用于 SSH）
 - `RUNTIME_ENV`：运行环境变量内容（多行）
+- `STUDIO_HTTP_API_KEY`：小豆包 API key（独立 secret，便于轮换）
 
 `RUNTIME_ENV` 示例：
 
@@ -70,9 +71,9 @@ VITE_API_BASE_URL=http://127.0.0.1:8899
 BACKEND_PORT=8899
 FRONTEND_PORT=5174
 VITE_API_BASE_URL=
-STUDIO_HTTP_API_KEY=sk-xxxx
 ```
 
+`STUDIO_HTTP_API_KEY` 请单独放到 GitHub Secret（不要写在 `RUNTIME_ENV` 里）。  
 说明：当 `STUDIO_HTTP_API_KEY` 存在时，后端会优先使用该值，且设置接口不会返回明文 key。
 
 ### 2) 触发部署
