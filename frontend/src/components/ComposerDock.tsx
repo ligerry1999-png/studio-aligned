@@ -66,6 +66,7 @@ interface ComposerDockProps {
   annotationActive?: boolean;
   annotationPreservedMentionIds?: string[];
   sendDisabled?: boolean;
+  sendDisabledReason?: string;
   uploadAssets: StudioAsset[];
   generatedAssets: StudioAsset[];
   savedAssets: StudioAsset[];
@@ -260,6 +261,7 @@ export function ComposerDock({
   annotationActive = false,
   annotationPreservedMentionIds = [],
   sendDisabled = false,
+  sendDisabledReason = '',
   uploadAssets,
   generatedAssets,
   savedAssets,
@@ -320,6 +322,11 @@ export function ComposerDock({
   const mentionComposerPlaceholder = mentionSettings?.composer_placeholder || '描述你的想法，输入@触发选择素材，单条消息最多9张素材';
   const mentionSearchPlaceholder = mentionSettings?.search_placeholder || '搜索素材标题...';
   const mentionUploadButtonText = mentionSettings?.upload_button_text || '点击 / 拖拽 / 粘贴 上传';
+  const sendBlockedReason = sending
+    ? '当前会话正在生成，请稍候再发送'
+    : sendDisabled
+      ? sendDisabledReason || '当前内容暂不可发送'
+      : '';
 
   const sortedSources = useMemo(() => {
     const list = mentionSettings?.sources || [
@@ -952,129 +959,135 @@ export function ComposerDock({
           </Stack>
         </Box>
 
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 2 }}>
-          {/* Left: Mode Toggle */}
-          <Stack direction="row" spacing={0.5} alignItems="center">
-            <ToggleButtonGroup
-              size="small"
-              exclusive
-              value={mode}
-              onChange={(_event, value) => {
-                if (value) setMode(value);
-              }}
-              sx={{
-                '& .MuiToggleButton-root': {
-                  border: 'none',
-                  color: '#6b7280',
-                  bgcolor: 'transparent',
-                  borderRadius: '6px !important',
-                  px: 1,
-                  py: 0.4,
-                  textTransform: 'none',
-                  fontSize: 12,
-                  fontWeight: 500,
-                },
-                '& .Mui-selected': {
-                  bgcolor: 'rgba(0,0,0,0.06) !important',
-                  color: '#1a1a1a !important',
-                },
-              }}
-            >
-              <ToggleButton value="image">
-                <Stack direction="row" spacing={0.4} alignItems="center">
-                  <ImageRoundedIcon sx={{ fontSize: 14 }} />
-                  <span>Image</span>
-                </Stack>
-              </ToggleButton>
-            </ToggleButtonGroup>
-          </Stack>
+        <Stack spacing={0.7} sx={{ mt: 2 }}>
+          <Stack direction="row" spacing={1} alignItems="center">
+            {/* Left: Mode Toggle */}
+            <Stack direction="row" spacing={0.5} alignItems="center">
+              <ToggleButtonGroup
+                size="small"
+                exclusive
+                value={mode}
+                onChange={(_event, value) => {
+                  if (value) setMode(value);
+                }}
+                sx={{
+                  '& .MuiToggleButton-root': {
+                    border: 'none',
+                    color: '#6b7280',
+                    bgcolor: 'transparent',
+                    borderRadius: '6px !important',
+                    px: 1,
+                    py: 0.4,
+                    textTransform: 'none',
+                    fontSize: 12,
+                    fontWeight: 500,
+                  },
+                  '& .Mui-selected': {
+                    bgcolor: 'rgba(0,0,0,0.06) !important',
+                    color: '#1a1a1a !important',
+                  },
+                }}
+              >
+                <ToggleButton value="image">
+                  <Stack direction="row" spacing={0.4} alignItems="center">
+                    <ImageRoundedIcon sx={{ fontSize: 14 }} />
+                    <span>Image</span>
+                  </Stack>
+                </ToggleButton>
+              </ToggleButtonGroup>
+            </Stack>
+            <Box sx={{ flex: 1 }} />
 
-          <Box sx={{ flex: 1 }} />
-
-          <Stack direction="row" spacing={0.7} useFlexGap flexWrap="wrap" justifyContent="flex-end">
-            <Box
-              component="select"
-              value={params.model}
-              onChange={(event) => onParamsChange({ model: event.target.value })}
-              sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: '100%', sm: 126 } }}
-              aria-label="模型"
-            >
-              {modelOptions.map((item) => (
-                <option key={String(item.value)} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </Box>
-            <IconButton
-              size="small"
-              onClick={() => inputRef.current?.click()}
-              sx={{
-                width: 30,
-                height: 30,
-                borderRadius: 1.6,
-                border: '1px solid rgba(129, 102, 77, 0.18)',
-                bgcolor: '#ede6de',
-                color: '#72553c',
-              }}
-            >
-              <ImageRoundedIcon sx={{ fontSize: 16 }} />
-            </IconButton>
-            <Box
-              component="select"
-              value={params.aspect_ratio}
-              onChange={(event) => onParamsChange({ aspect_ratio: event.target.value })}
-              sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 74 } }}
-              aria-label="比例"
-            >
-              {ratioOptions.map((item) => (
-                <option key={String(item.value)} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </Box>
-            <Box
-              component="select"
-              value={params.quality}
-              onChange={(event) => onParamsChange({ quality: event.target.value })}
-              sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 70 } }}
-              aria-label="清晰度"
-            >
-              {qualityOptions.map((item) => (
-                <option key={String(item.value)} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </Box>
-            <Box
-              component="select"
-              value={params.count}
-              onChange={(event) => onParamsChange({ count: Number(event.target.value) })}
-              sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 84 } }}
-              aria-label="同时生成"
-            >
-              {countOptions.map((item) => (
-                <option key={String(item.value)} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </Box>
-            <Button
-              variant="contained"
-              disabled={sending || sendDisabled}
-              onClick={onSend}
-              sx={{
-                minWidth: 30,
-                width: 30,
-                height: 30,
-                borderRadius: 1.6,
-                p: 0,
-                bgcolor: '#8a5b35',
-                '&:hover': { bgcolor: '#744b2c' },
-              }}
-            >
-              <SendRoundedIcon sx={{ fontSize: 16 }} />
-            </Button>
+            <Stack direction="row" spacing={0.7} useFlexGap flexWrap="wrap" justifyContent="flex-end">
+              <Box
+                component="select"
+                value={params.model}
+                onChange={(event) => onParamsChange({ model: event.target.value })}
+                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: '100%', sm: 126 } }}
+                aria-label="模型"
+              >
+                {modelOptions.map((item) => (
+                  <option key={String(item.value)} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Box>
+              <IconButton
+                size="small"
+                onClick={() => inputRef.current?.click()}
+                sx={{
+                  width: 30,
+                  height: 30,
+                  borderRadius: 1.6,
+                  border: '1px solid rgba(129, 102, 77, 0.18)',
+                  bgcolor: '#ede6de',
+                  color: '#72553c',
+                }}
+              >
+                <ImageRoundedIcon sx={{ fontSize: 16 }} />
+              </IconButton>
+              <Box
+                component="select"
+                value={params.aspect_ratio}
+                onChange={(event) => onParamsChange({ aspect_ratio: event.target.value })}
+                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 74 } }}
+                aria-label="比例"
+              >
+                {ratioOptions.map((item) => (
+                  <option key={String(item.value)} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Box>
+              <Box
+                component="select"
+                value={params.quality}
+                onChange={(event) => onParamsChange({ quality: event.target.value })}
+                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 70 } }}
+                aria-label="清晰度"
+              >
+                {qualityOptions.map((item) => (
+                  <option key={String(item.value)} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Box>
+              <Box
+                component="select"
+                value={params.count}
+                onChange={(event) => onParamsChange({ count: Number(event.target.value) })}
+                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 84 } }}
+                aria-label="同时生成"
+              >
+                {countOptions.map((item) => (
+                  <option key={String(item.value)} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Box>
+              <Button
+                variant="contained"
+                disabled={sending || sendDisabled}
+                onClick={onSend}
+                sx={{
+                  minWidth: 30,
+                  width: 30,
+                  height: 30,
+                  borderRadius: 1.6,
+                  p: 0,
+                  bgcolor: '#8a5b35',
+                  '&:hover': { bgcolor: '#744b2c' },
+                }}
+              >
+                <SendRoundedIcon sx={{ fontSize: 16 }} />
+              </Button>
+            </Stack>
           </Stack>
+          {sendBlockedReason ? (
+            <Typography variant="caption" sx={{ color: '#b2433d', fontWeight: 700 }}>
+              {sendBlockedReason}
+            </Typography>
+          ) : null}
         </Stack>
 
         {/* Hidden file input for upload */}

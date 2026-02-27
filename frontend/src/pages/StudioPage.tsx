@@ -975,6 +975,16 @@ export function StudioPage() {
     return { disabled: false, reason: '' };
   }, [annotationContexts, composerText]);
 
+  const composerSendDisabledReason = useMemo(() => {
+    if (isCurrentWorkspaceSending) {
+      return '当前会话正在生成，请稍候再发送';
+    }
+    if (annotationSendGuard.disabled) {
+      return annotationSendGuard.reason || '当前内容暂不可发送';
+    }
+    return '';
+  }, [annotationSendGuard.disabled, annotationSendGuard.reason, isCurrentWorkspaceSending]);
+
   async function handleCreateWorkspace() {
     const name = window.prompt('会话名称', '室内设计会话');
     if (name === null) return;
@@ -1450,6 +1460,7 @@ export function StudioPage() {
                   annotationActive={Boolean(annotatorTarget)}
                   annotationPreservedMentionIds={annotationContexts.map((item) => item.mention_id)}
                   sendDisabled={annotationSendGuard.disabled}
+                  sendDisabledReason={composerSendDisabledReason}
                   uploadAssets={uploadSourceAssets}
                   generatedAssets={generatedAssets}
                   savedAssets={savedAssets}
