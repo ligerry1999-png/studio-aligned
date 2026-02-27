@@ -322,11 +322,12 @@ export function ComposerDock({
   const mentionComposerPlaceholder = mentionSettings?.composer_placeholder || '描述你的想法，输入@触发选择素材，单条消息最多9张素材';
   const mentionSearchPlaceholder = mentionSettings?.search_placeholder || '搜索素材标题...';
   const mentionUploadButtonText = mentionSettings?.upload_button_text || '点击 / 拖拽 / 粘贴 上传';
-  const sendBlockedReason = sending
-    ? '当前会话正在生成，请稍候再发送'
-    : sendDisabled
-      ? sendDisabledReason || '当前内容暂不可发送'
-      : '';
+  const sendBlockedReason = sendDisabled
+    ? sendDisabledReason || '当前内容暂不可发送'
+    : '';
+  const sendQueueHint = sending && !sendBlockedReason
+    ? '当前会话正在生成中，新消息会自动排队'
+    : '';
 
   const sortedSources = useMemo(() => {
     const list = mentionSettings?.sources || [
@@ -1067,7 +1068,7 @@ export function ComposerDock({
               </Box>
               <Button
                 variant="contained"
-                disabled={sending || sendDisabled}
+                disabled={sendDisabled}
                 onClick={onSend}
                 sx={{
                   minWidth: 30,
@@ -1086,6 +1087,10 @@ export function ComposerDock({
           {sendBlockedReason ? (
             <Typography variant="caption" sx={{ color: '#b2433d', fontWeight: 700 }}>
               {sendBlockedReason}
+            </Typography>
+          ) : sendQueueHint ? (
+            <Typography variant="caption" sx={{ color: '#7a6b5d', fontWeight: 600 }}>
+              {sendQueueHint}
             </Typography>
           ) : null}
         </Stack>

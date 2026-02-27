@@ -52,7 +52,17 @@ interface PendingTurn {
   text: string;
   params: GenerationParams;
   createdAt: string;
-  startedAtMs: number;
+  startedAtMs: number | null;
+  status: 'queued' | 'running';
+}
+
+interface PendingTurnRequest {
+  workspaceId: string;
+  text: string;
+  params: GenerationParams;
+  attachmentIds: string[];
+  references: ComposerReference[];
+  annotationPayloads: AnnotationContextPayload[];
 }
 
 const MAX_MATERIAL_UNITS = 9;
@@ -575,6 +585,10 @@ export function StudioPage() {
   const [pendingTurnsByWorkspace, setPendingTurnsByWorkspace] = useState<Record<string, PendingTurn[]>>({});
   const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
   const currentWorkspaceIdRef = useRef<string | null>(null);
+  const pendingTurnsByWorkspaceRef = useRef<Record<string, PendingTurn[]>>({});
+  const pendingTurnRequestsRef = useRef<Record<string, PendingTurnRequest>>({});
+  const processingWorkspaceIdsRef = useRef<Set<string>>(new Set());
+  const hasPersistedRunningMessageRef = useRef<boolean>(false);
   const objectNameMapRef = useRef<Record<string, Record<string, string>>>({});
 
   const [toast, setToast] = useState<{ open: boolean; message: string; severity: 'success' | 'error' }>({
@@ -739,6 +753,9 @@ export function StudioPage() {
     () => Object.values(pendingTurnsByWorkspace).reduce((sum, list) => sum + list.length, 0),
     [pendingTurnsByWorkspace],
   );
+  useEffect(() => {
+    pendingTurnsByWorkspaceRef.current = pendingTurnsByWorkspace;
+  }, [pendingTurnsByWorkspace]);
 
   useEffect(() => {
     if (totalPendingTurns <= 0) return;
@@ -753,6 +770,9 @@ export function StudioPage() {
       (message) => message.role === 'assistant' && message.status === 'running',
     );
   }, [currentWorkspace]);
+  useEffect(() => {
+    hasPersistedRunningMessageRef.current = hasPersistedRunningMessage;
+  }, [hasPersistedRunningMessage]);
   useEffect(() => {
     if (!currentWorkspace?.id || !hasPersistedRunningMessage) return;
     let disposed = false;
@@ -783,8 +803,19 @@ export function StudioPage() {
   const workspaceTitle = useMemo(() => currentWorkspace?.name || '未选择会话', [currentWorkspace]);
   const workspaceMeta = useMemo(() => {
     const messageCount = currentWorkspace?.messages.length || 0;
-    const pendingCount = currentWorkspace ? (pendingTurnsByWorkspace[currentWorkspace.id]?.length ?? 0) : 0;
-    return pendingCount > 0 ? `${messageCount} 条消息 · 生成中 ${pendingCount}` : `${messageCount} 条消息`;
+    const pendingTurns = currentWorkspace ? (pendingTurnsByWorkspace[currentWorkspace.id] || []) : [];
+    if (pendingTurns.length === 0) {
+      return `${messageCount} 条消息`;
+    }
+    const runningCount = pendingTurns.filter((item) => item.status === 'running').length;
+    const queuedCount = Math.max(0, pendingTurns.length - runningCount);
+    if (runningCount > 0 && queuedCount > 0) {
+      return `${messageCount} 条消息 · 生成中 ${runningCount} · 排队 ${queuedCount}`;
+    }
+    if (runningCount > 0) {
+      return `${messageCount} 条消息 · 生成中 ${runningCount}`;
+    }
+    return `${messageCount} 条消息 · 排队 ${queuedCount}`;
   }, [currentWorkspace, pendingTurnsByWorkspace]);
   const generatedAssets = useMemo(() => {
     if (!currentWorkspace) return [];
@@ -817,10 +848,21 @@ export function StudioPage() {
     if (!currentWorkspace) return [];
     const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
     if (pendingTurns.length === 0) return [];
-    if (hasPersistedRunningMessage) return [];
     const nowMs = progressNowMs;
-    return pendingTurns.flatMap((turn) => {
-      const elapsedSeconds = Math.max(1, Math.floor((nowMs - turn.startedAtMs) / 1000));
+    const visibleTurns = hasPersistedRunningMessage
+      ? pendingTurns.filter((turn) => turn.status === 'queued')
+      : pendingTurns;
+    if (visibleTurns.length === 0) return [];
+    const persistedRunningAhead = hasPersistedRunningMessage ? 1 : 0;
+    return visibleTurns.flatMap((turn, index) => {
+      const parsedCreatedAtMs = Date.parse(turn.createdAt);
+      const createdAtMs = Number.isFinite(parsedCreatedAtMs) ? parsedCreatedAtMs : nowMs;
+      const runningSinceMs = turn.startedAtMs ?? createdAtMs;
+      const elapsedSeconds = Math.max(1, Math.floor((nowMs - runningSinceMs) / 1000));
+      const queueAheadCount = persistedRunningAhead + index;
+      const assistantText = turn.status === 'running'
+        ? `正在生成中... 已耗时 ${elapsedSeconds}s`
+        : `排队中... 前方还有 ${queueAheadCount} 个任务`;
       return [
         {
           id: `${turn.id}-user`,
@@ -833,7 +875,7 @@ export function StudioPage() {
         {
           id: `${turn.id}-assistant`,
           role: 'assistant',
-          text: `正在生成中... 已耗时 ${elapsedSeconds}s`,
+          text: assistantText,
           params: turn.params,
           status: 'running',
           created_at: turn.createdAt,
@@ -853,8 +895,9 @@ export function StudioPage() {
 
   const isCurrentWorkspaceSending = useMemo(() => {
     if (!currentWorkspace) return false;
-    return (pendingTurnsByWorkspace[currentWorkspace.id]?.length ?? 0) > 0;
-  }, [currentWorkspace, pendingTurnsByWorkspace]);
+    const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
+    return pendingTurns.some((item) => item.status === 'running') || hasPersistedRunningMessage;
+  }, [currentWorkspace, pendingTurnsByWorkspace, hasPersistedRunningMessage]);
 
   const handleAnnotationContextChange = useCallback((draft: AnnotationDraftContext) => {
     if (!annotatorTarget) return;
@@ -976,14 +1019,119 @@ export function StudioPage() {
   }, [annotationContexts, composerText]);
 
   const composerSendDisabledReason = useMemo(() => {
-    if (isCurrentWorkspaceSending) {
-      return '当前会话正在生成，请稍候再发送';
-    }
     if (annotationSendGuard.disabled) {
       return annotationSendGuard.reason || '当前内容暂不可发送';
     }
     return '';
-  }, [annotationSendGuard.disabled, annotationSendGuard.reason, isCurrentWorkspaceSending]);
+  }, [annotationSendGuard.disabled, annotationSendGuard.reason]);
+
+  const isWorkspaceBlockedByPersistedRunning = useCallback((workspaceId: string): boolean => {
+    if (!workspaceId) return false;
+    if (workspaceId !== currentWorkspaceIdRef.current) return false;
+    return hasPersistedRunningMessageRef.current;
+  }, []);
+
+  const removePendingTurn = useCallback((workspaceId: string, pendingId: string) => {
+    delete pendingTurnRequestsRef.current[pendingId];
+    setPendingTurnsByWorkspace((prev) => {
+      const list = prev[workspaceId] || [];
+      const nextList = list.filter((item) => item.id !== pendingId);
+      if (nextList.length === list.length) return prev;
+      if (nextList.length === 0) {
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      }
+      return {
+        ...prev,
+        [workspaceId]: nextList,
+      };
+    });
+  }, []);
+
+  const processWorkspaceQueue = useCallback(async (workspaceId: string) => {
+    if (!workspaceId) return;
+    if (processingWorkspaceIdsRef.current.has(workspaceId)) return;
+    if (isWorkspaceBlockedByPersistedRunning(workspaceId)) return;
+    processingWorkspaceIdsRef.current.add(workspaceId);
+    try {
+      while (true) {
+        if (isWorkspaceBlockedByPersistedRunning(workspaceId)) break;
+        const pendingList = pendingTurnsByWorkspaceRef.current[workspaceId] || [];
+        const nextTurn = pendingList.find((item) => item.status === 'queued');
+        if (!nextTurn) break;
+
+        const startedAtMs = Date.now();
+        setPendingTurnsByWorkspace((prev) => {
+          const list = prev[workspaceId] || [];
+          let changed = false;
+          const nextList: PendingTurn[] = list.map((item): PendingTurn => {
+            if (item.id !== nextTurn.id || item.status !== 'queued') return item;
+            changed = true;
+            return { ...item, status: 'running', startedAtMs };
+          });
+          if (!changed) return prev;
+          return {
+            ...prev,
+            [workspaceId]: nextList,
+          };
+        });
+
+        const requestPayload = pendingTurnRequestsRef.current[nextTurn.id];
+        if (!requestPayload) {
+          removePendingTurn(workspaceId, nextTurn.id);
+          continue;
+        }
+
+        try {
+          const result = await studioApi.createTurn(workspaceId, {
+            text: requestPayload.text,
+            params: requestPayload.params,
+            attachment_asset_ids: requestPayload.attachmentIds,
+            references: requestPayload.references,
+            annotation_contexts: requestPayload.annotationPayloads,
+          });
+          removePendingTurn(workspaceId, nextTurn.id);
+          if (currentWorkspaceIdRef.current === workspaceId) {
+            appendTurn(result.user_message, result.assistant_message);
+          }
+          try {
+            await refreshSessions();
+            await refreshDynamicSourceAssets();
+            if (currentWorkspaceIdRef.current === workspaceId) {
+              await loadWorkspace(workspaceId);
+            }
+          } catch {
+            // 后台生成成功后，列表刷新失败不应影响主流程
+          }
+          showToast('生成完成');
+        } catch (error) {
+          removePendingTurn(workspaceId, nextTurn.id);
+          try {
+            if (currentWorkspaceIdRef.current === workspaceId) {
+              await loadWorkspace(workspaceId);
+            }
+            await refreshSessions();
+          } catch {
+            // 错误态消息刷新失败时不阻塞提示
+          }
+          const message = error instanceof Error ? error.message : '生成失败';
+          showToast(message, 'error');
+        }
+      }
+    } finally {
+      processingWorkspaceIdsRef.current.delete(workspaceId);
+    }
+  }, [appendTurn, isWorkspaceBlockedByPersistedRunning, loadWorkspace, refreshDynamicSourceAssets, refreshSessions, removePendingTurn]);
+
+  useEffect(() => {
+    const workspaceId = currentWorkspace?.id;
+    if (!workspaceId) return;
+    if (isWorkspaceBlockedByPersistedRunning(workspaceId)) return;
+    const hasQueuedTurns = (pendingTurnsByWorkspace[workspaceId] || []).some((item) => item.status === 'queued');
+    if (!hasQueuedTurns) return;
+    void processWorkspaceQueue(workspaceId);
+  }, [currentWorkspace?.id, isWorkspaceBlockedByPersistedRunning, pendingTurnsByWorkspace, processWorkspaceQueue]);
 
   async function handleCreateWorkspace() {
     const name = window.prompt('会话名称', '室内设计会话');
@@ -1004,6 +1152,12 @@ export function StudioPage() {
     if (!ok) return;
     try {
       await studioApi.deleteWorkspace(workspaceId);
+      Object.keys(pendingTurnRequestsRef.current).forEach((pendingId) => {
+        if (pendingTurnRequestsRef.current[pendingId]?.workspaceId === workspaceId) {
+          delete pendingTurnRequestsRef.current[pendingId];
+        }
+      });
+      processingWorkspaceIdsRef.current.delete(workspaceId);
       setPendingTurnsByWorkspace((prev) => {
         if (!prev[workspaceId]) return prev;
         const next = { ...prev };
@@ -1117,8 +1271,8 @@ export function StudioPage() {
     }
   }
 
-  async function handleSendTurn() {
-    if (!currentWorkspace || isCurrentWorkspaceSending) return;
+  function handleSendTurn() {
+    if (!currentWorkspace) return;
     const targetWorkspaceId = currentWorkspace.id;
     const text = composerText.trim();
     const { ordered, missingSlots } = orderedReferencesFromText(text, composerReferences);
@@ -1157,8 +1311,20 @@ export function StudioPage() {
       text,
       params: { ...params },
       createdAt: new Date().toISOString(),
-      startedAtMs: Date.now(),
+      startedAtMs: null,
+      status: 'queued',
     };
+    pendingTurnRequestsRef.current[pendingId] = {
+      workspaceId: targetWorkspaceId,
+      text,
+      params: { ...params },
+      attachmentIds,
+      references: ordered,
+      annotationPayloads,
+    };
+    const queueAheadCount =
+      (pendingTurnsByWorkspaceRef.current[targetWorkspaceId]?.length ?? 0) +
+      (isWorkspaceBlockedByPersistedRunning(targetWorkspaceId) ? 1 : 0);
     setPendingTurnsByWorkspace((prev) => ({
       ...prev,
       [targetWorkspaceId]: (prev[targetWorkspaceId] || []).concat(pendingTurn),
@@ -1170,68 +1336,10 @@ export function StudioPage() {
     // 发送即退出标注模式，回到消息流视图
     setAnnotatorTarget(null);
     setLightboxAsset(null);
-
-    try {
-      const result = await studioApi.createTurn(targetWorkspaceId, {
-        text,
-        params,
-        attachment_asset_ids: attachmentIds,
-        references: ordered,
-        annotation_contexts: annotationPayloads,
-      });
-      setPendingTurnsByWorkspace((prev) => {
-        const list = prev[targetWorkspaceId] || [];
-        const nextList = list.filter((item) => item.id !== pendingId);
-        if (nextList.length === list.length) return prev;
-        if (nextList.length === 0) {
-          const next = { ...prev };
-          delete next[targetWorkspaceId];
-          return next;
-        }
-        return {
-          ...prev,
-          [targetWorkspaceId]: nextList,
-        };
-      });
-      if (currentWorkspaceIdRef.current === targetWorkspaceId) {
-        appendTurn(result.user_message, result.assistant_message);
-      }
-      try {
-        await refreshSessions();
-        await refreshDynamicSourceAssets();
-        if (currentWorkspaceIdRef.current === targetWorkspaceId) {
-          await loadWorkspace(targetWorkspaceId);
-        }
-      } catch {
-        // 后台生成成功后，列表刷新失败不应影响主流程
-      }
-      showToast('生成完成');
-    } catch (error) {
-      setPendingTurnsByWorkspace((prev) => {
-        const list = prev[targetWorkspaceId] || [];
-        const nextList = list.filter((item) => item.id !== pendingId);
-        if (nextList.length === list.length) return prev;
-        if (nextList.length === 0) {
-          const next = { ...prev };
-          delete next[targetWorkspaceId];
-          return next;
-        }
-        return {
-          ...prev,
-          [targetWorkspaceId]: nextList,
-        };
-      });
-      try {
-        if (currentWorkspaceIdRef.current === targetWorkspaceId) {
-          await loadWorkspace(targetWorkspaceId);
-        }
-        await refreshSessions();
-      } catch {
-        // 错误态消息刷新失败时不阻塞提示
-      }
-      const message = error instanceof Error ? error.message : '生成失败';
-      showToast(message, 'error');
+    if (queueAheadCount > 0) {
+      showToast(`已加入队列，前方还有 ${queueAheadCount} 个任务`);
     }
+    void processWorkspaceQueue(targetWorkspaceId);
   }
 
   async function reloadCurrentWorkspace() {
