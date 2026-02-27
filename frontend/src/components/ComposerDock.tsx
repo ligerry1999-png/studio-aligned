@@ -83,7 +83,7 @@ interface ComposerDockProps {
   onParamsChange: (patch: Partial<GenerationParams>) => void;
   onUploadFiles: (files: File[]) => Promise<StudioAsset[]>;
   onConsumeInsertAssetRequest: () => void;
-  onAnnotateReference: (assetId: string) => void;
+  onAnnotateReference: (reference: ComposerReference) => void;
   onSend: () => void;
 }
 
@@ -156,7 +156,7 @@ interface HighlightSegment {
 function splitComposerTextByMentions(text: string, highlightedSlots: Set<string>): HighlightSegment[] {
   if (!text) return [{ content: '', highlighted: false }];
   const segments: HighlightSegment[] = [];
-  const regex = /@图[1-9]|【对象[1-3]】/g;
+  const regex = /@图[1-9]|【对象(?:[1-9])】/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
@@ -924,7 +924,7 @@ export function ComposerDock({
                 key={refItem.mention_id}
                 refItem={refItem}
                 onRemove={handleRemoveReference}
-                onAnnotate={(item) => onAnnotateReference(item.asset_id)}
+                onAnnotate={(item) => onAnnotateReference(item)}
               />
             ))}
           </Stack>

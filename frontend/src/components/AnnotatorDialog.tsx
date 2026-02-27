@@ -19,9 +19,8 @@ import type { StudioAsset } from '../types/studio';
 interface AnnotatorDialogProps {
   open: boolean;
   asset: StudioAsset | null;
-  saving: boolean;
+  initialSnapshot?: Record<string, unknown> | null;
   onClose: () => void;
-  onSave: (snapshot: Record<string, unknown>) => void;
   onContextChange?: (context: AnnotationDraftContext) => void;
 }
 
@@ -181,9 +180,8 @@ function extractAnnotationContext(snapshot: unknown, assetId: string): Extracted
 export function AnnotatorDialog({
   open,
   asset,
-  saving,
+  initialSnapshot = null,
   onClose,
-  onSave,
   onContextChange,
 }: AnnotatorDialogProps) {
   const editorRef = useRef<Editor | null>(null);
@@ -194,11 +192,11 @@ export function AnnotatorDialog({
   const [imageRatio, setImageRatio] = useState(3 / 4);
 
   const snapshot = useMemo(() => {
-    const raw = asset?.annotation_snapshot;
+    const raw = initialSnapshot;
     if (!raw || typeof raw !== 'object') return undefined;
     if (Object.keys(raw).length === 0) return undefined;
     return raw as unknown as TLEditorSnapshot | TLStoreSnapshot;
-  }, [asset?.annotation_snapshot]);
+  }, [initialSnapshot]);
 
   const emitContext = useCallback(() => {
     const editor = editorRef.current;
@@ -239,14 +237,9 @@ export function AnnotatorDialog({
     });
   }, []);
 
-  const saveAndClose = useCallback(() => {
-    const editor = editorRef.current;
-    if (editor && asset) {
-      const data = getSnapshot(editor.store);
-      onSave(data as unknown as Record<string, unknown>);
-    }
+  const closeDialog = useCallback(() => {
     onClose();
-  }, [asset, onClose, onSave]);
+  }, [onClose]);
 
   const deleteSelected = useCallback(() => {
     const editor = editorRef.current;
@@ -267,13 +260,13 @@ export function AnnotatorDialog({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
-      saveAndClose();
+      closeDialog();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [open, saveAndClose]);
+  }, [open, closeDialog]);
 
   useEffect(() => {
     if (open) return;
@@ -327,7 +320,7 @@ export function AnnotatorDialog({
     >
       <Box
         onMouseDown={() => {
-          saveAndClose();
+          closeDialog();
         }}
         sx={{
           position: 'absolute',
@@ -394,8 +387,7 @@ export function AnnotatorDialog({
           <Tooltip title="返回" placement="left">
             <span>
               <IconButton
-                onClick={saveAndClose}
-                disabled={saving}
+                onClick={closeDialog}
                 sx={{ width: 38, height: 38, color: '#6f6254' }}
               >
                 <ArrowBackRoundedIcon fontSize="small" />

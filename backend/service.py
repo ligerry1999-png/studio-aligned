@@ -31,6 +31,7 @@ class CreateTurnRequest(BaseModel):
     attachment_asset_ids: List[str] = Field(default_factory=list)
     references: List[Dict[str, Any]] = Field(default_factory=list)
     annotation_context: Dict[str, Any] = Field(default_factory=dict)
+    annotation_contexts: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SaveAnnotationRequest(BaseModel):
@@ -1433,39 +1434,73 @@ class StudioService:
             "move_relation": move_relation,
         }
 
-    def _annotation_context_to_prompt(self, context: Dict[str, Any]) -> str:
-        if not isinstance(context, dict):
-            return ""
-        objects = context.get("objects")
-        if not isinstance(objects, list) or len(objects) == 0:
+    def _normalize_annotation_contexts(self, payload: Any) -> List[Dict[str, Any]]:
+        contexts_raw: List[Any]
+        if isinstance(payload, list):
+            contexts_raw = payload
+        elif isinstance(payload, dict):
+            contexts_raw = [payload]
+        else:
+            contexts_raw = []
+
+        normalized: List[Dict[str, Any]] = []
+        seen_assets: set = set()
+        for item in contexts_raw:
+            context = self._normalize_annotation_context(item)
+            if not isinstance(context, dict):
+                continue
+            objects = context.get("objects")
+            if not isinstance(objects, list) or len(objects) == 0:
+                continue
+            asset_id = str(context.get("asset_id") or "").strip()
+            if asset_id and asset_id in seen_assets:
+                continue
+            if asset_id:
+                seen_assets.add(asset_id)
+            normalized.append(context)
+        return normalized
+
+    def _annotation_contexts_to_prompt(self, contexts: List[Dict[str, Any]]) -> str:
+        if not isinstance(contexts, list) or len(contexts) == 0:
             return ""
         lines = ["[标注上下文]"]
-        for item in objects:
-            if not isinstance(item, dict):
+        for ctx_index, context in enumerate(contexts, start=1):
+            if not isinstance(context, dict):
                 continue
-            object_id = str(item.get("id") or "").strip()
-            text = str(item.get("text") or "").strip()
-            bbox = item.get("bbox")
-            if not object_id:
+            objects = context.get("objects")
+            if not isinstance(objects, list) or len(objects) == 0:
                 continue
-            bbox_desc = ""
-            if isinstance(bbox, dict):
-                try:
-                    bbox_desc = " (x={:.1f}, y={:.1f}, w={:.1f}, h={:.1f})".format(
-                        float(bbox.get("x") or 0.0),
-                        float(bbox.get("y") or 0.0),
-                        float(bbox.get("w") or 0.0),
-                        float(bbox.get("h") or 0.0),
-                    )
-                except Exception:
-                    bbox_desc = ""
-            lines.append(f"- {object_id}{bbox_desc}: {text or '未填写'}")
-        move_relation = context.get("move_relation")
-        if isinstance(move_relation, dict):
-            source_id = str(move_relation.get("source_id") or "").strip()
-            target_id = str(move_relation.get("target_id") or "").strip()
-            if source_id and target_id:
-                lines.append(f"- 移动关系: {source_id} -> {target_id}")
+            asset_id = str(context.get("asset_id") or "").strip()
+            if asset_id:
+                lines.append(f"- 图片{ctx_index} (asset_id={asset_id})")
+            else:
+                lines.append(f"- 图片{ctx_index}")
+            for item in objects:
+                if not isinstance(item, dict):
+                    continue
+                object_id = str(item.get("id") or "").strip()
+                text = str(item.get("text") or "").strip()
+                bbox = item.get("bbox")
+                if not object_id:
+                    continue
+                bbox_desc = ""
+                if isinstance(bbox, dict):
+                    try:
+                        bbox_desc = " (x={:.1f}, y={:.1f}, w={:.1f}, h={:.1f})".format(
+                            float(bbox.get("x") or 0.0),
+                            float(bbox.get("y") or 0.0),
+                            float(bbox.get("w") or 0.0),
+                            float(bbox.get("h") or 0.0),
+                        )
+                    except Exception:
+                        bbox_desc = ""
+                lines.append(f"  - {object_id}{bbox_desc}: {text or '未填写'}")
+            move_relation = context.get("move_relation")
+            if isinstance(move_relation, dict):
+                source_id = str(move_relation.get("source_id") or "").strip()
+                target_id = str(move_relation.get("target_id") or "").strip()
+                if source_id and target_id:
+                    lines.append(f"  - 移动关系: {source_id} -> {target_id}")
         if len(lines) <= 1:
             return ""
         return "\n".join(lines)
@@ -1621,6 +1656,7 @@ class StudioService:
         attachment_asset_ids: List[str],
         references: Optional[List[Dict[str, Any]]] = None,
         annotation_context: Optional[Dict[str, Any]] = None,
+        annotation_contexts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         session = self._load_session_raw(session_id)
         if not session:
@@ -1666,12 +1702,18 @@ class StudioService:
             if self._resolve_asset(aid) is None:
                 continue
             valid_attachment_ids.append(aid)
-        normalized_annotation_context = self._normalize_annotation_context(annotation_context)
-        annotation_asset_id = str(normalized_annotation_context.get("asset_id") or "").strip()
-        if annotation_asset_id and annotation_asset_id not in valid_attachment_ids and self._resolve_asset(annotation_asset_id):
-            valid_attachment_ids.insert(0, annotation_asset_id)
+        raw_annotation_contexts: List[Dict[str, Any]] = []
+        if isinstance(annotation_contexts, list):
+            raw_annotation_contexts.extend([item for item in annotation_contexts if isinstance(item, dict)])
+        if isinstance(annotation_context, dict) and annotation_context:
+            raw_annotation_contexts.append(annotation_context)
+        normalized_annotation_contexts = self._normalize_annotation_contexts(raw_annotation_contexts)
+        for context in normalized_annotation_contexts:
+            annotation_asset_id = str(context.get("asset_id") or "").strip()
+            if annotation_asset_id and annotation_asset_id not in valid_attachment_ids and self._resolve_asset(annotation_asset_id):
+                valid_attachment_ids.append(annotation_asset_id)
         composed_text = (text or "").strip()
-        annotation_prompt = self._annotation_context_to_prompt(normalized_annotation_context)
+        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts)
         if annotation_prompt:
             if composed_text:
                 composed_text = f"{annotation_prompt}\n\n原始需求:\n{composed_text}"
@@ -1685,7 +1727,8 @@ class StudioService:
             "attachment_asset_ids": valid_attachment_ids,
             "image_asset_ids": [],
             "references": valid_references,
-            "annotation_context": normalized_annotation_context,
+            "annotation_context": normalized_annotation_contexts[0] if normalized_annotation_contexts else {},
+            "annotation_contexts": normalized_annotation_contexts,
             "status": "completed",
             "created_at": _now_iso(),
         }

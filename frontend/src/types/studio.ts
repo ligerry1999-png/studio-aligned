@@ -134,6 +134,7 @@ export interface CreateTurnPayload {
   attachment_asset_ids: string[];
   references?: ComposerReference[];
   annotation_context?: AnnotationContextPayload;
+  annotation_contexts?: AnnotationContextPayload[];
 }
 
 export interface TurnResult {

@@ -55,8 +55,9 @@ interface PendingTurn {
   startedAtMs: number;
 }
 
-const OBJECT_LABELS = ['对象1', '对象2', '对象3'] as const;
-const SYSTEM_OBJECT_LINE_REGEX = /^\s*将【对象([1-3])】里的「([^」]*)」(?:移动到【对象([1-3])】)?(.*)$/;
+const MAX_MATERIAL_UNITS = 9;
+const OBJECT_LABELS: string[] = Array.from({ length: MAX_MATERIAL_UNITS }, (_, index) => `对象${index + 1}`);
+const SYSTEM_OBJECT_LINE_REGEX = /^\s*(?:将)?【对象([1-9])】里的「([^」]*)」(?:移动到【对象([1-9])】)?(.*)$/;
 
 interface ComposerAnnotationObject {
   id: string;
@@ -70,12 +71,19 @@ interface ComposerAnnotationObject {
 }
 
 interface ComposerAnnotationContextState {
+  mention_id: string;
+  reference_slot: string;
   asset_id: string;
   objects: ComposerAnnotationObject[];
   move_relation: {
     source_id: string;
     target_id: string;
   } | null;
+}
+
+interface AnnotatorTargetState {
+  asset: StudioAsset;
+  reference: ComposerReference;
 }
 
 function dedupeAssets(list: StudioAsset[]): StudioAsset[] {
@@ -144,14 +152,7 @@ function orderedReferencesFromText(text: string, references: ComposerReference[]
   ordered: ComposerReference[];
   missingSlots: string[];
 } {
-  const tokenMatches = text.match(/@图[1-9]/g) || [];
-  const tokenSlots: string[] = [];
-  tokenMatches.forEach((token) => {
-    const slot = token.slice(1);
-    if (!tokenSlots.includes(slot)) {
-      tokenSlots.push(slot);
-    }
-  });
+  const tokenSlots = extractOrderedSlots(text);
 
   const bySlot = new Map(references.map((ref) => [ref.slot, ref]));
   const ordered: ComposerReference[] = [];
@@ -165,6 +166,15 @@ function orderedReferencesFromText(text: string, references: ComposerReference[]
     ordered.push({ ...found, order: index + 1 });
   });
   return { ordered, missingSlots };
+}
+
+function nextAvailableSlotFromReferences(references: ComposerReference[]): string | null {
+  const used = new Set(references.map((item) => item.slot));
+  for (let index = 1; index <= MAX_MATERIAL_UNITS; index += 1) {
+    const slot = `图${index}`;
+    if (!used.has(slot)) return slot;
+  }
+  return null;
 }
 
 async function blobToPng(blob: Blob): Promise<Blob> {
@@ -296,6 +306,33 @@ function parseSystemObjectLines(text: string): Map<string, { content: string; ta
   return map;
 }
 
+function extractOrderedSlots(text: string): string[] {
+  const tokenMatches = text.match(/@图[1-9]/g) || [];
+  const tokenSlots: string[] = [];
+  tokenMatches.forEach((token) => {
+    const slot = token.slice(1);
+    if (!tokenSlots.includes(slot)) {
+      tokenSlots.push(slot);
+    }
+  });
+  return tokenSlots;
+}
+
+function stripSlotToken(text: string, slot: string): string {
+  const escaped = slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`@${escaped}(?=\\s|$)`, 'g');
+  return text.replace(pattern, '').replace(/[ \t]{2,}/g, ' ');
+}
+
+function ensureSlotTokenExists(text: string, slot: string): string {
+  if (!slot) return text;
+  const pattern = new RegExp(`@${slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`);
+  if (pattern.test(text)) return text;
+  const trimmed = text.trim();
+  if (!trimmed) return `@${slot}`;
+  return `${trimmed} @${slot}`;
+}
+
 function stripSystemObjectLines(text: string): string {
   const kept = text
     .split('\n')
@@ -309,29 +346,36 @@ function stripSystemObjectLines(text: string): string {
 function buildSystemObjectLine(label: string, content: string, targetLabel?: string, suffix = ''): string {
   const normalized = content.trim() || '请填写';
   const core = targetLabel
-    ? `将【${label}】里的「${normalized}」移动到【${targetLabel}】`
-    : `将【${label}】里的「${normalized}」`;
+    ? `【${label}】里的「${normalized}」移动到【${targetLabel}】`
+    : `【${label}】里的「${normalized}」`;
   return `${core}${suffix || ''}`;
 }
 
-function mergeComposerTextWithAnnotation(
+function mergeComposerTextWithAnnotations(
   text: string,
-  context: ComposerAnnotationContextState | null,
+  contexts: ComposerAnnotationContextState[],
 ): string {
   const existing = parseSystemObjectLines(text);
   const base = stripSystemObjectLines(text).trim();
-  if (!context || context.objects.length === 0) {
+  if (contexts.length === 0) {
     return base;
   }
-  const lines = context.objects.map((item) => {
-    const existingItem = existing.get(item.id);
-    const content = existingItem?.content ?? '请填写';
-    const targetLabel =
-      context.move_relation && context.move_relation.source_id === item.id
-        ? context.move_relation.target_id
-        : undefined;
-    return buildSystemObjectLine(item.id, content, targetLabel, existingItem?.suffix || '');
+  const sortedContexts = [...contexts].sort((a, b) => {
+    const firstA = a.objects[0]?.id || '';
+    const firstB = b.objects[0]?.id || '';
+    return Number(firstA.replace('对象', '')) - Number(firstB.replace('对象', ''));
   });
+  const lines = sortedContexts.flatMap((context) =>
+    context.objects.map((item) => {
+      const existingItem = existing.get(item.id);
+      const content = existingItem?.content ?? '请填写';
+      const targetLabel =
+        context.move_relation && context.move_relation.source_id === item.id
+          ? context.move_relation.target_id
+          : undefined;
+      return buildSystemObjectLine(item.id, content, targetLabel, existingItem?.suffix || '');
+    }),
+  );
   return [base, ...lines].filter((item) => item.length > 0).join('\n');
 }
 
@@ -375,7 +419,6 @@ export function StudioPage() {
 
   const [initializing, setInitializing] = useState(true);
   const [officialLoading, setOfficialLoading] = useState(false);
-  const [savingAnnotation, setSavingAnnotation] = useState(false);
 
   const [params, setParams] = useState<GenerationParams>(DEFAULT_PARAMS);
   const [composerText, setComposerText] = useState('');
@@ -390,8 +433,8 @@ export function StudioPage() {
   const officialCursorRef = useRef<string | null>(null);
 
   const [lightboxAsset, setLightboxAsset] = useState<StudioAsset | null>(null);
-  const [annotatorAsset, setAnnotatorAsset] = useState<StudioAsset | null>(null);
-  const [annotationContext, setAnnotationContext] = useState<ComposerAnnotationContextState | null>(null);
+  const [annotatorTarget, setAnnotatorTarget] = useState<AnnotatorTargetState | null>(null);
+  const [annotationContextsByMention, setAnnotationContextsByMention] = useState<Record<string, ComposerAnnotationContextState>>({});
   const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig | null>(null);
   const [runtimeDialogOpen, setRuntimeDialogOpen] = useState(false);
   const [runtimeSaving, setRuntimeSaving] = useState(false);
@@ -633,6 +676,10 @@ export function StudioPage() {
     () => savedAssets,
     [savedAssets],
   );
+  const annotationContexts = useMemo(
+    () => Object.values(annotationContextsByMention),
+    [annotationContextsByMention],
+  );
 
   const pendingMessagesForCurrentWorkspace = useMemo((): StudioMessage[] => {
     if (!currentWorkspace) return [];
@@ -678,24 +725,39 @@ export function StudioPage() {
   }, [currentWorkspace, pendingTurnsByWorkspace]);
 
   const handleAnnotationContextChange = useCallback((draft: AnnotationDraftContext) => {
-    const assetId = draft.asset_id;
-    if (!assetId) return;
+    if (!annotatorTarget) return;
+    const mentionId = String(annotatorTarget.reference.mention_id || '').trim();
+    const referenceSlot = String(annotatorTarget.reference.slot || '').trim();
+    const assetId = String(draft.asset_id || annotatorTarget.asset.id || '').trim();
+    if (!mentionId || !referenceSlot || !assetId) return;
 
-    const previousMap = objectNameMapRef.current[assetId] || {};
+    const otherContexts = Object.values(annotationContextsByMention).filter((item) => item.mention_id !== mentionId);
+    const reservedLabels = new Set(otherContexts.flatMap((item) => item.objects.map((obj) => obj.id)));
+    const mentionSlots = extractOrderedSlots(composerText);
+    const hasCurrentSlotToken = mentionSlots.includes(referenceSlot);
+    const directReferenceCountWithoutCurrent = mentionSlots.length - (hasCurrentSlotToken ? 1 : 0);
+    const otherObjectCount = otherContexts.reduce((sum, item) => sum + item.objects.length, 0);
+    const maxObjectsForCurrent = Math.max(
+      0,
+      Math.min(3, MAX_MATERIAL_UNITS - directReferenceCountWithoutCurrent - otherObjectCount),
+    );
+
+    const previousMap = objectNameMapRef.current[mentionId] || {};
     const nextMap: Record<string, string> = {};
     const usedLabels = new Set<string>();
-    const shapeIds = draft.boxes.map((item) => item.shape_id).filter(Boolean).slice(0, 3);
+    const shapeIds = draft.boxes.map((item) => item.shape_id).filter(Boolean).slice(0, maxObjectsForCurrent);
 
     shapeIds.forEach((shapeId) => {
       const existing = previousMap[shapeId];
       if (!existing) return;
-      if (!OBJECT_LABELS.includes(existing as (typeof OBJECT_LABELS)[number])) return;
+      if (!OBJECT_LABELS.includes(existing)) return;
+      if (reservedLabels.has(existing)) return;
       if (usedLabels.has(existing)) return;
       nextMap[shapeId] = existing;
       usedLabels.add(existing);
     });
 
-    const availableLabels = OBJECT_LABELS.filter((item) => !usedLabels.has(item));
+    const availableLabels = OBJECT_LABELS.filter((item) => !reservedLabels.has(item) && !usedLabels.has(item));
     shapeIds.forEach((shapeId) => {
       if (nextMap[shapeId]) return;
       const nextLabel = availableLabels.shift();
@@ -703,7 +765,7 @@ export function StudioPage() {
       nextMap[shapeId] = nextLabel;
       usedLabels.add(nextLabel);
     });
-    objectNameMapRef.current[assetId] = nextMap;
+    objectNameMapRef.current[mentionId] = nextMap;
 
     const objects: ComposerAnnotationObject[] = draft.boxes
       .filter((item) => Boolean(nextMap[item.shape_id]))
@@ -731,36 +793,58 @@ export function StudioPage() {
       }
     }
 
-    const nextContext: ComposerAnnotationContextState | null =
-      objects.length > 0
-        ? {
-            asset_id: assetId,
-            objects,
-            move_relation: moveRelation,
-          }
-        : null;
+    const nextContextsByMention = { ...annotationContextsByMention };
+    if (objects.length > 0) {
+      nextContextsByMention[mentionId] = {
+        mention_id: mentionId,
+        reference_slot: referenceSlot,
+        asset_id: assetId,
+        objects,
+        move_relation: moveRelation,
+      };
+    } else {
+      delete nextContextsByMention[mentionId];
+      delete objectNameMapRef.current[mentionId];
+    }
 
-    setAnnotationContext(nextContext);
-    setComposerText((prev) => mergeComposerTextWithAnnotation(prev, nextContext));
-  }, []);
+    setAnnotationContextsByMention(nextContextsByMention);
+    const nextContexts = Object.values(nextContextsByMention);
+    if (objects.length > 0) {
+      setComposerText((prev) => {
+        const withoutCurrentSlot = stripSlotToken(prev, referenceSlot);
+        return mergeComposerTextWithAnnotations(withoutCurrentSlot, nextContexts);
+      });
+      return;
+    }
+    setComposerText((prev) => {
+      const merged = mergeComposerTextWithAnnotations(prev, nextContexts);
+      return ensureSlotTokenExists(merged, referenceSlot);
+    });
+  }, [annotatorTarget, annotationContextsByMention, composerText]);
 
   const annotationSendGuard = useMemo(() => {
-    if (!annotationContext || annotationContext.objects.length === 0) {
+    if (annotationContexts.length === 0) {
       return { disabled: false, reason: '' };
     }
     const textMap = parseAnnotationTextsByObject(composerText);
-    const filledCount = annotationContext.objects.filter((item) => isObjectDescriptionFilled(textMap.get(item.id))).length;
+    const allObjects = annotationContexts.flatMap((item) => item.objects);
+    const filledCount = allObjects.filter((item) => isObjectDescriptionFilled(textMap.get(item.id))).length;
     if (filledCount === 0) {
       return { disabled: true, reason: '请至少填写一个对象的编辑内容' };
     }
-    if (annotationContext.move_relation) {
-      const sourceText = textMap.get(annotationContext.move_relation.source_id);
+    for (const item of annotationContexts) {
+      if (!item.move_relation) continue;
+      const sourceText = textMap.get(item.move_relation.source_id);
       if (!isObjectDescriptionFilled(sourceText)) {
         return { disabled: true, reason: '请填写移动源对象的内容' };
       }
     }
+    const directRefsCount = extractOrderedSlots(composerText).length;
+    if (directRefsCount + allObjects.length > MAX_MATERIAL_UNITS) {
+      return { disabled: true, reason: '单条消息最多 9 个素材单元（@图片 + 标注对象）' };
+    }
     return { disabled: false, reason: '' };
-  }, [annotationContext, composerText]);
+  }, [annotationContexts, composerText]);
 
   async function handleCreateWorkspace() {
     const name = window.prompt('会话名称', '室内设计会话');
@@ -817,19 +901,68 @@ export function StudioPage() {
     });
   }
 
-  function handleAnnotateReference(assetId: string) {
+  function findAssetById(assetId: string): StudioAsset | null {
     const normalizedId = String(assetId || '').trim();
-    if (!normalizedId) return;
+    if (!normalizedId) return null;
     const fromWorkspace = currentWorkspace
       ? currentWorkspace.messages.flatMap((message) => [...(message.attachments || []), ...(message.images || [])])
       : [];
     const pool = dedupeAssets(fromWorkspace.concat(savedAssets, generatedAssets, officialAssets));
-    const target = pool.find((asset) => asset.id === normalizedId && asset.kind !== 'deleted');
+    return pool.find((asset) => asset.id === normalizedId && asset.kind !== 'deleted') || null;
+  }
+
+  function handleAnnotateReference(reference: ComposerReference) {
+    const mentionId = String(reference.mention_id || '').trim();
+    const slot = String(reference.slot || '').trim();
+    const normalizedId = String(reference.asset_id || '').trim();
+    if (!normalizedId) return;
+    const target = findAssetById(normalizedId);
     if (!target) {
       showToast('未找到可标注的图片，请先确认素材存在', 'error');
       return;
     }
-    setAnnotatorAsset(target);
+    if (mentionId) {
+      const nextContextsByMention = { ...annotationContextsByMention };
+      if (nextContextsByMention[mentionId]) {
+        delete nextContextsByMention[mentionId];
+        delete objectNameMapRef.current[mentionId];
+        setAnnotationContextsByMention(nextContextsByMention);
+        setComposerText((prev) =>
+          ensureSlotTokenExists(
+            mergeComposerTextWithAnnotations(prev, Object.values(nextContextsByMention)),
+            slot,
+          ),
+        );
+      }
+    }
+    setAnnotatorTarget({ asset: target, reference });
+  }
+
+  function handleAnnotateAssetDirectly(asset: StudioAsset) {
+    const existedReference = composerReferences.find((item) => item.asset_id === asset.id);
+    const normalizedReference = existedReference
+      ? existedReference
+      : (() => {
+          const slot = nextAvailableSlotFromReferences(composerReferences);
+          if (!slot) return null;
+          return {
+            mention_id: `mention-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+            slot,
+            asset_id: asset.id,
+            source: asset.kind === 'official' ? 'official' : asset.kind === 'generated' ? 'generated' : 'library',
+            order: composerReferences.length + 1,
+            asset_title: asset.title,
+          } as ComposerReference;
+        })();
+    if (!normalizedReference) {
+      showToast('同一条消息最多可引用 9 张图片素材', 'error');
+      return;
+    }
+    if (!existedReference) {
+      setComposerReferences((prev) => prev.concat(normalizedReference));
+      setComposerText((prev) => ensureSlotTokenExists(prev, normalizedReference.slot));
+    }
+    handleAnnotateReference(normalizedReference);
   }
 
   async function handleUploadFiles(files: File[]): Promise<StudioAsset[]> {
@@ -865,19 +998,18 @@ export function StudioPage() {
     }
 
     const objectTextMap = parseAnnotationTextsByObject(composerText);
-    const annotationPayload: AnnotationContextPayload | undefined =
-      annotationContext && annotationContext.objects.length > 0
-        ? {
-            asset_id: annotationContext.asset_id,
-            objects: annotationContext.objects.map((item) => ({
-              id: item.id,
-              shape_id: item.shape_id,
-              bbox: item.bbox,
-              text: objectTextMap.get(item.id) || '',
-            })),
-            move_relation: moveRelationToPayload(annotationContext.move_relation),
-          }
-        : undefined;
+    const annotationPayloads: AnnotationContextPayload[] = annotationContexts
+      .filter((context) => context.objects.length > 0)
+      .map((context) => ({
+        asset_id: context.asset_id,
+        objects: context.objects.map((item) => ({
+          id: item.id,
+          shape_id: item.shape_id,
+          bbox: item.bbox,
+          text: objectTextMap.get(item.id) || '',
+        })),
+        move_relation: moveRelationToPayload(context.move_relation),
+      }));
 
     const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const pendingTurn: PendingTurn = {
@@ -894,9 +1026,10 @@ export function StudioPage() {
     }));
     setComposerText('');
     setComposerReferences([]);
-    setAnnotationContext(null);
+    setAnnotationContextsByMention({});
+    objectNameMapRef.current = {};
     // 发送即退出标注模式，回到消息流视图
-    setAnnotatorAsset(null);
+    setAnnotatorTarget(null);
     setLightboxAsset(null);
 
     try {
@@ -905,7 +1038,7 @@ export function StudioPage() {
         params,
         attachment_asset_ids: attachmentIds,
         references: ordered,
-        annotation_context: annotationPayload,
+        annotation_contexts: annotationPayloads,
       });
       setPendingTurnsByWorkspace((prev) => {
         const list = prev[targetWorkspaceId] || [];
@@ -979,11 +1112,18 @@ export function StudioPage() {
         setComposerText((prev) => prev.replace(regex, '').replace(/\\s{2,}/g, ' '));
         setComposerReferences((prev) => prev.filter((item) => item.asset_id !== asset.id));
       }
-      if (annotationContext?.asset_id === asset.id) {
-        setAnnotationContext(null);
-        setComposerText((prev) => mergeComposerTextWithAnnotation(prev, null));
+      const nextContextsByMention = Object.fromEntries(
+        Object.entries(annotationContextsByMention).filter(([, item]) => item.asset_id !== asset.id),
+      );
+      if (Object.keys(nextContextsByMention).length !== Object.keys(annotationContextsByMention).length) {
+        setAnnotationContextsByMention(nextContextsByMention);
+        Object.keys(objectNameMapRef.current).forEach((key) => {
+          if (!nextContextsByMention[key]) delete objectNameMapRef.current[key];
+        });
+        setComposerText((prev) => mergeComposerTextWithAnnotations(prev, Object.values(nextContextsByMention)));
       }
       if (lightboxAsset?.id === asset.id) setLightboxAsset(null);
+      if (annotatorTarget?.asset.id === asset.id) setAnnotatorTarget(null);
       await refreshDynamicSourceAssets();
       showToast('图片已删除');
     } catch (error) {
@@ -998,7 +1138,7 @@ export function StudioPage() {
     setWorkspaceUploadAssets((prev) => prev.map((asset) => (asset.id === updated.id ? { ...asset, ...updated } : asset)));
     patchAssetInWorkspace(updated);
     setLightboxAsset((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
-    setAnnotatorAsset((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
+    setAnnotatorTarget((prev) => (prev?.asset.id === updated.id ? { ...prev, asset: { ...prev.asset, ...updated } } : prev));
     showToast('素材名称已更新');
     return updated;
   }
@@ -1012,12 +1152,18 @@ export function StudioPage() {
       setComposerText((prev) => prev.replace(regex, '').replace(/\s{2,}/g, ' '));
       setComposerReferences((prev) => prev.filter((item) => item.asset_id !== assetId));
     }
-    if (annotationContext?.asset_id === assetId) {
-      setAnnotationContext(null);
-      setComposerText((prev) => mergeComposerTextWithAnnotation(prev, null));
+    const nextContextsByMention = Object.fromEntries(
+      Object.entries(annotationContextsByMention).filter(([, item]) => item.asset_id !== assetId),
+    );
+    if (Object.keys(nextContextsByMention).length !== Object.keys(annotationContextsByMention).length) {
+      setAnnotationContextsByMention(nextContextsByMention);
+      Object.keys(objectNameMapRef.current).forEach((key) => {
+        if (!nextContextsByMention[key]) delete objectNameMapRef.current[key];
+      });
+      setComposerText((prev) => mergeComposerTextWithAnnotations(prev, Object.values(nextContextsByMention)));
     }
     if (lightboxAsset?.id === assetId) setLightboxAsset(null);
-    if (annotatorAsset?.id === assetId) setAnnotatorAsset(null);
+    if (annotatorTarget?.asset.id === assetId) setAnnotatorTarget(null);
     await refreshDynamicSourceAssets();
     showToast('上传素材已删除');
   }
@@ -1041,7 +1187,7 @@ export function StudioPage() {
         return;
       }
       if (action === 'annotate') {
-        setAnnotatorAsset(asset);
+        handleAnnotateAssetDirectly(asset);
         return;
       }
       if (action === 'zoom') {
@@ -1054,25 +1200,6 @@ export function StudioPage() {
     } catch (error) {
       const message = error instanceof Error ? error.message : '操作失败';
       showToast(message, 'error');
-    }
-  }
-
-  async function handleSaveAnnotation(snapshot: Record<string, unknown>) {
-    if (!annotatorAsset) return;
-    setSavingAnnotation(true);
-    try {
-      const updated = await studioApi.saveAnnotation(annotatorAsset.id, snapshot);
-      patchAssetInWorkspace(updated);
-      setOfficialAssets((prev) => prev.map((asset) => (asset.id === updated.id ? { ...asset, ...updated } : asset)));
-      setSavedAssets((prev) => prev.map((asset) => (asset.id === updated.id ? { ...asset, ...updated } : asset)));
-      setLightboxAsset((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
-      setAnnotatorAsset(null);
-      showToast('标注已保存');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '标注保存失败';
-      showToast(message, 'error');
-    } finally {
-      setSavingAnnotation(false);
     }
   }
 
@@ -1107,6 +1234,28 @@ export function StudioPage() {
 
   async function handleUploadMentionStaticItem(sourceId: string, file: File): Promise<MentionSourceItem> {
     return studioApi.uploadMentionStaticItem(sourceId, file);
+  }
+
+  function handleComposerReferencesChange(nextReferences: ComposerReference[]) {
+    const removedMentionIds = composerReferences
+      .filter((item) => !nextReferences.some((next) => next.mention_id === item.mention_id))
+      .map((item) => item.mention_id);
+    setComposerReferences(nextReferences);
+    if (removedMentionIds.length === 0) return;
+    const nextContextsByMention = { ...annotationContextsByMention };
+    let changed = false;
+    removedMentionIds.forEach((mentionId) => {
+      if (!nextContextsByMention[mentionId]) return;
+      delete nextContextsByMention[mentionId];
+      delete objectNameMapRef.current[mentionId];
+      changed = true;
+    });
+    if (!changed) return;
+    if (annotatorTarget && removedMentionIds.includes(annotatorTarget.reference.mention_id)) {
+      setAnnotatorTarget(null);
+    }
+    setAnnotationContextsByMention(nextContextsByMention);
+    setComposerText((prev) => mergeComposerTextWithAnnotations(prev, Object.values(nextContextsByMention)));
   }
 
   return (
@@ -1169,7 +1318,7 @@ export function StudioPage() {
                   references={composerReferences}
                   params={params}
                   options={options}
-                  annotationActive={Boolean(annotatorAsset)}
+                  annotationActive={Boolean(annotatorTarget)}
                   sendDisabled={annotationSendGuard.disabled}
                   uploadAssets={uploadSourceAssets}
                   generatedAssets={generatedAssets}
@@ -1189,7 +1338,7 @@ export function StudioPage() {
                   insertAssetRequest={insertAssetRequest}
                   sending={isCurrentWorkspaceSending}
                   onTextChange={setComposerText}
-                  onReferencesChange={setComposerReferences}
+                  onReferencesChange={handleComposerReferencesChange}
                   onParamsChange={(patch) => setParams((prev) => ({ ...prev, ...patch }))}
                   onUploadFiles={handleUploadFiles}
                   onConsumeInsertAssetRequest={() => setInsertAssetRequest(null)}
@@ -1219,7 +1368,7 @@ export function StudioPage() {
         }}
         onAnnotate={(asset) => {
           setLightboxAsset(null);
-          setAnnotatorAsset(asset);
+          handleAnnotateAssetDirectly(asset);
         }}
         onDelete={(asset) => {
           void handleImageAction('delete', asset);
@@ -1227,14 +1376,11 @@ export function StudioPage() {
       />
 
       <AnnotatorDialog
-        open={Boolean(annotatorAsset)}
-        asset={annotatorAsset}
-        saving={savingAnnotation}
-        onClose={() => setAnnotatorAsset(null)}
+        open={Boolean(annotatorTarget)}
+        asset={annotatorTarget?.asset || null}
+        initialSnapshot={null}
+        onClose={() => setAnnotatorTarget(null)}
         onContextChange={handleAnnotationContextChange}
-        onSave={(snapshot) => {
-          void handleSaveAnnotation(snapshot);
-        }}
       />
 
       <ApiSettingsDialog

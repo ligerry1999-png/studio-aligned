@@ -116,6 +116,7 @@ def create_app() -> FastAPI:
             attachment_asset_ids=payload.attachment_asset_ids,
             references=payload.references,
             annotation_context=payload.annotation_context,
+            annotation_contexts=payload.annotation_contexts,
         )
 
     @app.delete("/api/v1/images/{image_id}")
