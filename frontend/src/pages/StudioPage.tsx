@@ -288,19 +288,23 @@ function summaryFromDetail(detail: {
   };
 }
 
-function parseSystemObjectLines(text: string): Map<string, { content: string; target?: string; suffix?: string }> {
-  const map = new Map<string, { content: string; target?: string; suffix?: string }>();
+function parseSystemObjectLines(
+  text: string,
+): Map<string, { content: string; target?: string; suffix?: string; lineIndex: number }> {
+  const map = new Map<string, { content: string; target?: string; suffix?: string; lineIndex: number }>();
   const lines = text.split('\n');
-  lines.forEach((line) => {
+  lines.forEach((line, lineIndex) => {
     const matched = line.match(SYSTEM_OBJECT_LINE_REGEX);
     if (!matched) return;
     const objectLabel = `对象${matched[1]}`;
+    if (map.has(objectLabel)) return;
     const targetLabel = matched[3] ? `对象${matched[3]}` : undefined;
     const suffix = matched[4] ?? '';
     map.set(objectLabel, {
       content: matched[2] ?? '',
       target: targetLabel,
       suffix,
+      lineIndex,
     });
   });
   return map;
@@ -318,15 +322,13 @@ function extractOrderedSlots(text: string): string[] {
   return tokenSlots;
 }
 
-function stripSlotToken(text: string, slot: string): string {
-  const escaped = slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`@${escaped}(?=\\s|$)`, 'g');
-  return text.replace(pattern, '').replace(/[ \t]{2,}/g, ' ');
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function ensureSlotTokenExists(text: string, slot: string): string {
   if (!slot) return text;
-  const pattern = new RegExp(`@${slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`);
+  const pattern = new RegExp(`@${escapeRegExp(slot)}(?=\\s|$)`);
   if (pattern.test(text)) return text;
   const trimmed = text.trim();
   if (!trimmed) return `@${slot}`;
@@ -351,32 +353,162 @@ function buildSystemObjectLine(label: string, content: string, targetLabel?: str
   return `${core}${suffix || ''}`;
 }
 
+function normalizeSystemObjectSuffix(suffix: string): string {
+  if (!suffix) return '';
+  let normalized = String(suffix);
+  normalized = normalized.replace(/(?:\s*(?:将)?【对象[1-9]】里的「[^」]*」(?:移动到【对象[1-9]】)?)/g, '');
+  normalized = normalized.replace(/[ \t]{2,}/g, ' ');
+  normalized = normalized.replace(/\s+$/g, '');
+  return normalized;
+}
+
 function mergeComposerTextWithAnnotations(
   text: string,
   contexts: ComposerAnnotationContextState[],
 ): string {
   const existing = parseSystemObjectLines(text);
-  const base = stripSystemObjectLines(text).trim();
-  if (contexts.length === 0) {
-    return base;
-  }
-  const sortedContexts = [...contexts].sort((a, b) => {
-    const firstA = a.objects[0]?.id || '';
-    const firstB = b.objects[0]?.id || '';
-    return Number(firstA.replace('对象', '')) - Number(firstB.replace('对象', ''));
+  if (contexts.length === 0) return stripSystemObjectLines(text).trim();
+
+  const contextDefs = contexts
+    .map((context) => {
+      const sortedObjects = [...context.objects].sort(
+        (a, b) => Number(a.id.replace('对象', '')) - Number(b.id.replace('对象', '')),
+      );
+      const objectIds = sortedObjects.map((item) => item.id);
+      const objectLines = new Map<string, string>();
+      sortedObjects.forEach((item) => {
+        const existingItem = existing.get(item.id);
+        const content = existingItem?.content ?? '请填写';
+        const suffix = normalizeSystemObjectSuffix(existingItem?.suffix || '');
+        const targetLabel =
+          context.move_relation && context.move_relation.source_id === item.id
+            ? context.move_relation.target_id
+            : undefined;
+        objectLines.set(item.id, buildSystemObjectLine(item.id, content, targetLabel, suffix));
+      });
+      const firstObjectOrder = Number((objectIds[0] || '').replace('对象', '')) || 999;
+      return {
+        slot: String(context.reference_slot || '').trim(),
+        objectIds,
+        objectLines,
+        firstObjectOrder,
+      };
+    })
+    .filter((item) => item.objectIds.length > 0)
+    .sort((a, b) => a.firstObjectOrder - b.firstObjectOrder);
+
+  const emittedObjectIds = new Set<string>();
+  const outputLines: string[] = [];
+  const outputLineIndexByObjectId = new Map<string, number>();
+  const rawLines = text.split('\n');
+
+  rawLines.forEach((rawLine) => {
+    let line = rawLine;
+    let lineObjectId: string | null = null;
+    const matched = rawLine.match(SYSTEM_OBJECT_LINE_REGEX);
+    if (matched) {
+      const objectId = `对象${matched[1]}`;
+      if (emittedObjectIds.has(objectId)) {
+        // 重复对象行只保留尾部非对象文本，避免旧残留导致重复。
+        line = normalizeSystemObjectSuffix(matched[4] || '');
+      } else {
+        let replacementLine = '';
+        for (const def of contextDefs) {
+          const candidate = def.objectLines.get(objectId);
+          if (!candidate) continue;
+          replacementLine = candidate;
+          break;
+        }
+        if (replacementLine) {
+          line = replacementLine;
+          lineObjectId = objectId;
+          emittedObjectIds.add(objectId);
+        } else {
+          line = normalizeSystemObjectSuffix(matched[4] || '');
+        }
+      }
+    }
+
+    const pendingInsertedBlocks: Array<{ objectIds: string[]; objectLines: string[] }> = [];
+    contextDefs.forEach((def) => {
+      if (!def.slot) return;
+      if (def.objectIds.every((id) => emittedObjectIds.has(id))) return;
+      const slotPattern = new RegExp(`@${escapeRegExp(def.slot)}(?=\\s|$)`);
+      if (!slotPattern.test(line)) return;
+      line = line.replace(slotPattern, '').replace(/[ \t]{2,}/g, ' ').replace(/\s+$/g, '');
+      const insertedIds: string[] = [];
+      const insertedLines: string[] = [];
+      def.objectIds.forEach((id) => {
+        if (emittedObjectIds.has(id)) return;
+        const objectLine = def.objectLines.get(id);
+        if (!objectLine) return;
+        insertedIds.push(id);
+        insertedLines.push(objectLine);
+        emittedObjectIds.add(id);
+      });
+      if (insertedLines.length > 0) {
+        pendingInsertedBlocks.push({ objectIds: insertedIds, objectLines: insertedLines });
+      }
+    });
+
+    if (line.trim().length > 0 || rawLine.trim().length === 0) {
+      outputLines.push(line);
+      if (lineObjectId) {
+        outputLineIndexByObjectId.set(lineObjectId, outputLines.length - 1);
+      }
+    }
+
+    pendingInsertedBlocks.forEach((entry) => {
+      entry.objectLines.forEach((objectLine, idx) => {
+        outputLines.push(objectLine);
+        const objectId = entry.objectIds[idx];
+        if (objectId) {
+          outputLineIndexByObjectId.set(objectId, outputLines.length - 1);
+        }
+      });
+    });
   });
-  const lines = sortedContexts.flatMap((context) =>
-    context.objects.map((item) => {
-      const existingItem = existing.get(item.id);
-      const content = existingItem?.content ?? '请填写';
-      const targetLabel =
-        context.move_relation && context.move_relation.source_id === item.id
-          ? context.move_relation.target_id
-          : undefined;
-      return buildSystemObjectLine(item.id, content, targetLabel, existingItem?.suffix || '');
-    }),
-  );
-  return [base, ...lines].filter((item) => item.length > 0).join('\n');
+
+  const anchoredInsertions: Array<{ index: number; lines: string[] }> = [];
+  const tailAppendLines: string[] = [];
+  contextDefs.forEach((def) => {
+    const remainingIds = def.objectIds.filter((id) => !emittedObjectIds.has(id));
+    if (remainingIds.length === 0) return;
+    const remainingLines = remainingIds
+      .map((id) => def.objectLines.get(id) || '')
+      .filter(Boolean)
+      .map((line) => String(line));
+    if (remainingLines.length === 0) return;
+    let anchorIndex = -1;
+    def.objectIds.forEach((id) => {
+      if (!emittedObjectIds.has(id)) return;
+      const found = outputLineIndexByObjectId.get(id);
+      if (typeof found === 'number') {
+        anchorIndex = Math.max(anchorIndex, found);
+      }
+    });
+    if (anchorIndex >= 0) {
+      anchoredInsertions.push({ index: anchorIndex, lines: remainingLines });
+    } else {
+      tailAppendLines.push(...remainingLines);
+    }
+    remainingIds.forEach((id) => emittedObjectIds.add(id));
+  });
+
+  let insertedCount = 0;
+  anchoredInsertions
+    .sort((a, b) => a.index - b.index)
+    .forEach((entry) => {
+      const insertionIndex = entry.index + 1 + insertedCount;
+      outputLines.splice(insertionIndex, 0, ...entry.lines);
+      insertedCount += entry.lines.length;
+    });
+
+  if (tailAppendLines.length > 0) {
+    outputLines.push(...tailAppendLines);
+  }
+
+  return outputLines.join('\n').trim();
 }
 
 function parseAnnotationTextsByObject(text: string): Map<string, string> {
@@ -810,10 +942,7 @@ export function StudioPage() {
     setAnnotationContextsByMention(nextContextsByMention);
     const nextContexts = Object.values(nextContextsByMention);
     if (objects.length > 0) {
-      setComposerText((prev) => {
-        const withoutCurrentSlot = stripSlotToken(prev, referenceSlot);
-        return mergeComposerTextWithAnnotations(withoutCurrentSlot, nextContexts);
-      });
+      setComposerText((prev) => mergeComposerTextWithAnnotations(prev, nextContexts));
       return;
     }
     setComposerText((prev) => {
