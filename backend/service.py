@@ -1444,7 +1444,6 @@ class StudioService:
             contexts_raw = []
 
         normalized: List[Dict[str, Any]] = []
-        seen_assets: set = set()
         for item in contexts_raw:
             context = self._normalize_annotation_context(item)
             if not isinstance(context, dict):
@@ -1452,11 +1451,6 @@ class StudioService:
             objects = context.get("objects")
             if not isinstance(objects, list) or len(objects) == 0:
                 continue
-            asset_id = str(context.get("asset_id") or "").strip()
-            if asset_id and asset_id in seen_assets:
-                continue
-            if asset_id:
-                seen_assets.add(asset_id)
             normalized.append(context)
         return normalized
 
