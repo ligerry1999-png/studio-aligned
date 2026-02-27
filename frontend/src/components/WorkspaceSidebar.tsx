@@ -63,7 +63,7 @@ export function WorkspaceSidebar({
       <Box sx={{ mb: 3, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         {!collapsed && (
           <Typography variant="h6" fontWeight={700} sx={{ fontSize: 16 }}>
-            小巨人工作室
+            为兹科技
           </Typography>
         )}
         <IconButton
