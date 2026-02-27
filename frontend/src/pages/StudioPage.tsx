@@ -1319,6 +1319,7 @@ export function StudioPage() {
                   params={params}
                   options={options}
                   annotationActive={Boolean(annotatorTarget)}
+                  annotationPreservedMentionIds={annotationContexts.map((item) => item.mention_id)}
                   sendDisabled={annotationSendGuard.disabled}
                   uploadAssets={uploadSourceAssets}
                   generatedAssets={generatedAssets}

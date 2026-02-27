@@ -64,6 +64,7 @@ interface ComposerDockProps {
   params: GenerationParams;
   options: StudioOptions | null;
   annotationActive?: boolean;
+  annotationPreservedMentionIds?: string[];
   sendDisabled?: boolean;
   uploadAssets: StudioAsset[];
   generatedAssets: StudioAsset[];
@@ -123,9 +124,23 @@ function extractOrderedSlots(text: string): string[] {
   return ordered;
 }
 
-function syncReferencesWithText(text: string, refs: ComposerReference[]): ComposerReference[] {
+function syncReferencesWithText(
+  text: string,
+  refs: ComposerReference[],
+  preservedMentionIds: string[] = [],
+): ComposerReference[] {
   const slots = new Set(extractOrderedSlots(text));
-  return refs.filter((ref) => slots.has(ref.slot));
+  const preserved = new Set(
+    preservedMentionIds
+      .map((item) => String(item || '').trim())
+      .filter(Boolean),
+  );
+  return refs.filter((ref) => preserved.has(ref.mention_id) || slots.has(ref.slot));
+}
+
+function sameReferenceOrder(a: ComposerReference[], b: ComposerReference[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((item, index) => item.mention_id === b[index]?.mention_id);
 }
 
 function nextAvailableSlot(refs: ComposerReference[]): string | null {
@@ -243,6 +258,7 @@ export function ComposerDock({
   params,
   options,
   annotationActive = false,
+  annotationPreservedMentionIds = [],
   sendDisabled = false,
   uploadAssets,
   generatedAssets,
@@ -482,8 +498,12 @@ export function ComposerDock({
 
   function handleTextareaChange(nextText: string, caret: number) {
     onTextChange(nextText);
-    const synced = syncReferencesWithText(nextText, references);
-    if (synced.length !== references.length) {
+    const synced = syncReferencesWithText(
+      nextText,
+      references,
+      annotationPreservedMentionIds,
+    );
+    if (!sameReferenceOrder(synced, references)) {
       onReferencesChange(synced);
     }
     openPickerFromText(nextText, caret);
@@ -868,7 +888,8 @@ export function ComposerDock({
                     bgcolor: segment.objectToken ? 'rgba(123, 165, 120, 0.24)' : 'rgba(195, 132, 76, 0.26)',
                     color: segment.objectToken ? '#2f5f34' : '#6d4423',
                     borderRadius: 0.8,
-                    px: 0.3,
+                    boxDecorationBreak: 'clone',
+                    WebkitBoxDecorationBreak: 'clone',
                   } : undefined}
                 >
                   {segment.content}
@@ -908,6 +929,7 @@ export function ComposerDock({
                 fontSize: '15px',
                 lineHeight: 1.55,
                 color: 'transparent',
+                WebkitTextFillColor: 'transparent',
                 caretColor: '#2a2a2a',
                 p: 0,
                 m: 0,
