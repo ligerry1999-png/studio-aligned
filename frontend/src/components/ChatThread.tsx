@@ -11,7 +11,7 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { resolveAssetUrl } from '../api/client';
 import type { GenerationParams, StudioAsset, StudioMessage, WorkspaceDetail } from '../types/studio';
@@ -41,6 +41,22 @@ function normalizeTaskStatus(value?: string): TaskStatus {
   if (value === 'running') return 'running';
   if (value === 'failed') return 'failed';
   return 'completed';
+}
+
+function elapsedSecondsFromCreatedAt(createdAt?: string, nowMs: number = Date.now()): number | null {
+  if (!createdAt) return null;
+  const startedAtMs = Date.parse(createdAt);
+  if (Number.isNaN(startedAtMs)) return null;
+  return Math.max(1, Math.floor((nowMs - startedAtMs) / 1000));
+}
+
+function buildRunningText(text: string, createdAt: string | undefined, nowMs: number): string {
+  const base = (text || '正在生成中...').trim() || '正在生成中...';
+  if (/已耗时\s*\d+s/.test(base)) return base;
+  const elapsed = elapsedSecondsFromCreatedAt(createdAt, nowMs);
+  if (!elapsed) return base;
+  const normalizedBase = base.replace(/\s*\.{3}\s*$/, '').replace(/\s*…\s*$/, '').trim() || '正在生成中';
+  return `${normalizedBase}... 已耗时 ${elapsed}s`;
 }
 
 function formatTaskMetaItems(params?: Partial<GenerationParams>): string[] {
@@ -89,17 +105,20 @@ function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
 function TaskCard({
   task,
   order,
+  nowMs,
   onOpenAsset,
   onImageAction,
 }: {
   task: TaskItem;
   order: number;
+  nowMs: number;
   onOpenAsset: (asset: StudioAsset) => void;
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
 }) {
   const metaItems = formatTaskMetaItems(task.params);
   const hasResultPanel = task.status === 'running' || task.status === 'failed' || task.images.length > 0;
   const pendingImageCount = Math.max(1, Math.min(4, Number(task.params?.count || 1) || 1));
+  const runningText = task.status === 'running' ? buildRunningText(task.runningText, task.created_at, nowMs) : '';
 
   return (
     <Box sx={{ borderRadius: 2.2, border: '1px solid rgba(0,0,0,0.07)', bgcolor: '#f9f4ed', p: 1.1 }}>
@@ -232,7 +251,7 @@ function TaskCard({
           >
             {task.status === 'running' ? (
               <Typography variant="body2" sx={{ mb: 0.9, color: '#3d6a4e', fontWeight: 600 }}>
-                {task.runningText || '正在生成中...'}
+                {runningText || '正在生成中...'}
               </Typography>
             ) : null}
 
@@ -392,6 +411,16 @@ function TaskCard({
 export function ChatThread({ workspace, onOpenAsset, onImageAction }: ChatThreadProps) {
   const messages = workspace?.messages;
   const tasks = useMemo(() => mergeMessagesToTasks(messages || []), [messages]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const hasRunningTask = useMemo(() => tasks.some((task) => task.status === 'running'), [tasks]);
+
+  useEffect(() => {
+    if (!hasRunningTask) return;
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTask]);
 
   return (
     <Box sx={{ height: '100%', minHeight: 0, overflowY: 'auto', px: { xs: 0.4, md: 1.5 }, py: 0.6 }}>
@@ -420,6 +449,7 @@ export function ChatThread({ workspace, onOpenAsset, onImageAction }: ChatThread
             key={task.id}
             task={task}
             order={index + 1}
+            nowMs={nowMs}
             onOpenAsset={onOpenAsset}
             onImageAction={onImageAction}
           />

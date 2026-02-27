@@ -572,6 +572,38 @@ export function StudioPage() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [totalPendingTurns]);
+  const hasPersistedRunningMessage = useMemo(() => {
+    if (!currentWorkspace) return false;
+    return currentWorkspace.messages.some(
+      (message) => message.role === 'assistant' && message.status === 'running',
+    );
+  }, [currentWorkspace]);
+  useEffect(() => {
+    if (!currentWorkspace?.id || !hasPersistedRunningMessage) return;
+    let disposed = false;
+    let inFlight = false;
+
+    const tick = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      try {
+        await loadWorkspace(currentWorkspace.id);
+        await refreshSessions();
+      } catch {
+        // 轮询失败时静默，避免打断当前编辑
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void tick();
+    }, 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [currentWorkspace?.id, hasPersistedRunningMessage, loadWorkspace, refreshSessions]);
 
   const workspaceTitle = useMemo(() => currentWorkspace?.name || '未选择会话', [currentWorkspace]);
   const workspaceMeta = useMemo(() => {
@@ -606,9 +638,6 @@ export function StudioPage() {
     if (!currentWorkspace) return [];
     const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
     if (pendingTurns.length === 0) return [];
-    const hasPersistedRunningMessage = currentWorkspace.messages.some(
-      (message) => message.role === 'assistant' && message.status === 'running',
-    );
     if (hasPersistedRunningMessage) return [];
     const nowMs = progressNowMs;
     return pendingTurns.flatMap((turn) => {
@@ -632,7 +661,7 @@ export function StudioPage() {
         },
       ];
     });
-  }, [currentWorkspace, pendingTurnsByWorkspace, progressNowMs]);
+  }, [currentWorkspace, pendingTurnsByWorkspace, progressNowMs, hasPersistedRunningMessage]);
 
   const displayWorkspace = useMemo(() => {
     if (!currentWorkspace) return null;
