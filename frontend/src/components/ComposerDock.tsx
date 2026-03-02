@@ -28,7 +28,15 @@ import {
   ToggleButtonGroup,
   Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
+} from 'react';
 
 import { resolveAssetUrl } from '../api/client';
 import type {
@@ -130,6 +138,25 @@ function hasImageDataTransfer(dataTransfer: DataTransfer | null | undefined): bo
   }
   const items = Array.from(dataTransfer.items || []);
   return items.some((item) => item.kind === 'file');
+}
+
+function collectClipboardImageFiles(dataTransfer: DataTransfer | null | undefined): File[] {
+  if (!dataTransfer) return [];
+  const directFiles = collectImageFiles(dataTransfer.files);
+  if (directFiles.length > 0) {
+    return directFiles;
+  }
+  const files: File[] = [];
+  for (const item of Array.from(dataTransfer.items || [])) {
+    if (item.kind !== 'file') continue;
+    const type = String(item.type || '').toLowerCase();
+    if (type && !type.startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file && isImageFile(file)) {
+      files.push(file);
+    }
+  }
+  return files;
 }
 
 function sourceFromAsset(asset: StudioAsset): MentionAssetSource {
@@ -555,8 +582,8 @@ export function ComposerDock({
 
       const token = `@${slot}`;
       nextText = nextText
-        ? `${nextText}${/\s$/.test(nextText) ? '' : ' '}${token}`
-        : token;
+        ? `${nextText}${/\s$/.test(nextText) ? '' : ' '}${token} `
+        : `${token} `;
       nextReferences.push({
         mention_id: `mention-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         slot,
@@ -690,6 +717,29 @@ export function ComposerDock({
     }
 
     setComposerDropUploading(true);
+    try {
+      await handleMentionUpload(files, { autoInsertToComposer: true });
+    } finally {
+      setComposerDropUploading(false);
+    }
+  }
+
+  async function handleComposerPaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const files = collectClipboardImageFiles(event.clipboardData);
+    if (files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (composerDropUploading || pickerUploading) {
+      setPickerError('图片上传中，请稍后再试');
+      return;
+    }
+
+    setComposerDropUploading(true);
+    setComposerDropActive(false);
+    composerDragDepthRef.current = 0;
     try {
       await handleMentionUpload(files, { autoInsertToComposer: true });
     } finally {
@@ -1112,6 +1162,9 @@ export function ComposerDock({
               }
               onKeyDown={(event) => {
                 if (event.key === 'Escape') closePicker();
+              }}
+              onPaste={(event) => {
+                void handleComposerPaste(event);
               }}
               placeholder={mentionComposerPlaceholder}
               rows={3}
