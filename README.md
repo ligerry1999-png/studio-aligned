@@ -7,9 +7,11 @@
 
 ## 双击启动（推荐）
 
-直接双击这个文件：
+直接双击项目根目录下这个文件：
 
-`/Users/bricoleur/Documents/ai创业-人形ip/product_photo_batch/studio_aligned/start_studio.command`
+`start_studio.command`
+
+如果你把项目挪了位置，脚本会自动向上查找包含 `backend` / `frontend` 的项目目录。
 
 它会自动：
 - 启动后端（`8899`）
@@ -19,7 +21,7 @@
 ## 1) 启动后端
 
 ```bash
-cd /Users/bricoleur/Documents/ai创业-人形ip/product_photo_batch/studio_aligned/backend
+cd <项目根目录>/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -29,7 +31,7 @@ uvicorn main:app --host 127.0.0.1 --port 8899 --reload
 ## 2) 启动前端
 
 ```bash
-cd /Users/bricoleur/Documents/ai创业-人形ip/product_photo_batch/studio_aligned/frontend
+cd <项目根目录>/frontend
 npm install
 npm run dev
 ```

@@ -5,8 +5,33 @@
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKEND_DIR="$SCRIPT_DIR/backend"
-FRONTEND_DIR="$SCRIPT_DIR/frontend"
+
+find_project_root_from() {
+  local dir="$1"
+  while [ -n "$dir" ]; do
+    if [ -d "$dir/backend" ] && [ -d "$dir/frontend" ]; then
+      echo "$dir"
+      return 0
+    fi
+    if [ "$dir" = "/" ]; then
+      break
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+if [ -n "$STUDIO_ALIGNED_ROOT" ]; then
+  PROJECT_ROOT="$STUDIO_ALIGNED_ROOT"
+else
+  PROJECT_ROOT="$(find_project_root_from "$SCRIPT_DIR" || true)"
+  if [ -z "$PROJECT_ROOT" ]; then
+    PROJECT_ROOT="$(find_project_root_from "$PWD" || true)"
+  fi
+fi
+
+BACKEND_DIR="$PROJECT_ROOT/backend"
+FRONTEND_DIR="$PROJECT_ROOT/frontend"
 BACKEND_PORT=8899
 FRONTEND_PORT=5174
 BACKEND_PID=""
@@ -71,8 +96,13 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-if [ ! -d "$BACKEND_DIR" ] || [ ! -d "$FRONTEND_DIR" ]; then
-  echo "❌ 目录结构不完整，请确保脚本位于 studio_aligned 下"
+if [ -z "$PROJECT_ROOT" ] || [ ! -d "$BACKEND_DIR" ] || [ ! -d "$FRONTEND_DIR" ]; then
+  echo "❌ 未找到项目目录（需同时包含 backend 和 frontend）"
+  echo "   当前脚本位置: $SCRIPT_DIR"
+  if [ -n "$STUDIO_ALIGNED_ROOT" ]; then
+    echo "   当前 STUDIO_ALIGNED_ROOT: $STUDIO_ALIGNED_ROOT"
+  fi
+  echo "   建议：把 start_studio.command 放在项目目录内，或设置 STUDIO_ALIGNED_ROOT 后再运行。"
   pause_and_exit
 fi
 
@@ -91,15 +121,34 @@ force_release_port "$FRONTEND_PORT" "前端" || pause_and_exit
 
 echo "🚀 正在启动后端..."
 cd "$BACKEND_DIR" || pause_and_exit
-if [ ! -d .venv ]; then
-  python3 -m venv .venv
-fi
-source .venv/bin/activate
-if ! python -c 'import uvicorn' >/dev/null 2>&1; then
-  pip install -r requirements.txt
+VENV_DIR="$BACKEND_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+
+if [ ! -x "$VENV_PYTHON" ]; then
+  echo "⚠️  检测到后端虚拟环境不可用，正在重建..."
+  rm -rf "$VENV_DIR"
+  python3 -m venv "$VENV_DIR" || {
+    echo "❌ 创建虚拟环境失败"
+    pause_and_exit
+  }
 fi
 
-python -m uvicorn main:app --host 127.0.0.1 --port "$BACKEND_PORT" --reload >/tmp/studio_aligned_backend.log 2>&1 &
+if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+  echo "⚠️  pip 不可用，正在修复..."
+  "$VENV_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1 || {
+    echo "❌ 修复 pip 失败"
+    pause_and_exit
+  }
+fi
+
+if ! "$VENV_PYTHON" -c 'import uvicorn' >/dev/null 2>&1; then
+  "$VENV_PYTHON" -m pip install -r requirements.txt || {
+    echo "❌ 安装后端依赖失败"
+    pause_and_exit
+  }
+fi
+
+"$VENV_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port "$BACKEND_PORT" --reload >/tmp/studio_aligned_backend.log 2>&1 &
 BACKEND_PID=$!
 sleep 1
 

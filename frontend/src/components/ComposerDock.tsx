@@ -28,7 +28,7 @@ import {
   ToggleButtonGroup,
   Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from 'react';
 
 import { resolveAssetUrl } from '../api/client';
 import type {
@@ -109,6 +109,34 @@ function dedupeById(list: StudioAsset[]): StudioAsset[] {
     seen.add(item.id);
     return true;
   });
+}
+
+function isImageFile(file: File): boolean {
+  const mime = String(file.type || '').toLowerCase();
+  if (mime.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name || '');
+}
+
+function collectImageFiles(list: FileList | File[] | null | undefined): File[] {
+  if (!list) return [];
+  return Array.from(list).filter((file) => isImageFile(file));
+}
+
+function hasImageDataTransfer(dataTransfer: DataTransfer | null | undefined): boolean {
+  if (!dataTransfer) return false;
+  const files = Array.from(dataTransfer.files || []);
+  if (files.some((file) => isImageFile(file))) {
+    return true;
+  }
+  const items = Array.from(dataTransfer.items || []);
+  return items.some((item) => item.kind === 'file');
+}
+
+function sourceFromAsset(asset: StudioAsset): MentionAssetSource {
+  if (asset.kind === 'official') return 'official';
+  if (asset.kind === 'generated') return 'generated';
+  if (asset.kind === 'saved') return 'library';
+  return 'upload';
 }
 
 function extractOrderedSlots(text: string): string[] {
@@ -296,11 +324,16 @@ export function ComposerDock({
   const [pickerError, setPickerError] = useState('');
   const [pickerUploading, setPickerUploading] = useState(false);
   const [pickerUploads, setPickerUploads] = useState<StudioAsset[]>([]);
+  const [composerDropActive, setComposerDropActive] = useState(false);
+  const [composerDropUploading, setComposerDropUploading] = useState(false);
   const [quickTemplateDialogOpen, setQuickTemplateDialogOpen] = useState(false);
   const [quickTemplateName, setQuickTemplateName] = useState('');
   const [quickTemplateContent, setQuickTemplateContent] = useState('');
   const [quickTemplateIsDefault, setQuickTemplateIsDefault] = useState(false);
   const handledInsertNonceRef = useRef<number>(0);
+  const latestTextRef = useRef(text);
+  const latestReferencesRef = useRef(references);
+  const composerDragDepthRef = useRef(0);
 
   const modelOptions = useMemo(
     () => (options?.models || []).map((item) => ({ value: item.id, label: item.name })),
@@ -353,6 +386,12 @@ export function ComposerDock({
     setPickerUploads([]);
     setPickerError('');
   }, [workspaceId]);
+  useEffect(() => {
+    latestTextRef.current = text;
+  }, [text]);
+  useEffect(() => {
+    latestReferencesRef.current = references;
+  }, [references]);
 
   const uploadCandidates = useMemo(
     () => dedupeById(pickerUploads.concat(uploadAssets)),
@@ -496,6 +535,57 @@ export function ComposerDock({
     [closePicker, mentionStart, onReferencesChange, onTextChange, references, text],
   );
 
+  const appendUploadedAssetsToComposer = useCallback((assets: StudioAsset[]) => {
+    if (assets.length === 0) {
+      return { insertedCount: 0, skippedCount: 0 };
+    }
+
+    let nextText = latestTextRef.current;
+    let nextReferences = [...latestReferencesRef.current];
+    let insertedCount = 0;
+
+    for (const asset of assets) {
+      if (!asset.id) continue;
+      if (nextReferences.some((item) => item.asset_id === asset.id)) {
+        continue;
+      }
+
+      const slot = nextAvailableSlot(nextReferences);
+      if (!slot) break;
+
+      const token = `@${slot}`;
+      nextText = nextText
+        ? `${nextText}${/\s$/.test(nextText) ? '' : ' '}${token}`
+        : token;
+      nextReferences.push({
+        mention_id: `mention-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        slot,
+        asset_id: asset.id,
+        source: sourceFromAsset(asset),
+        order: nextReferences.length + 1,
+        asset_title: asset.title,
+      });
+      insertedCount += 1;
+    }
+
+    if (insertedCount > 0) {
+      onTextChange(nextText);
+      onReferencesChange(nextReferences);
+      window.setTimeout(() => {
+        const target = textareaRef.current;
+        if (!target) return;
+        const cursor = nextText.length;
+        target.focus();
+        target.setSelectionRange(cursor, cursor);
+      }, 0);
+    }
+
+    return {
+      insertedCount,
+      skippedCount: Math.max(0, assets.length - insertedCount),
+    };
+  }, [onReferencesChange, onTextChange]);
+
   useEffect(() => {
     if (!insertAssetRequest) return;
     if (handledInsertNonceRef.current === insertAssetRequest.nonce) return;
@@ -523,19 +613,87 @@ export function ComposerDock({
     onReferencesChange(references.filter((item) => item.mention_id !== refItem.mention_id));
   }
 
-  async function handleMentionUpload(files: File[]) {
-    if (files.length === 0) return;
+  async function handleMentionUpload(files: File[], options?: { autoInsertToComposer?: boolean }) {
+    const imageFiles = collectImageFiles(files);
+    if (imageFiles.length === 0) {
+      if (files.length > 0) {
+        setPickerError('仅支持图片文件上传');
+      }
+      return;
+    }
+
     setPickerUploading(true);
     try {
-      const items = await onUploadFiles(files);
+      const items = await onUploadFiles(imageFiles);
       setPickerUploads((prev) => dedupeById(items.concat(prev)));
       setPickerSource('upload');
-      setPickerError('');
+      if (options?.autoInsertToComposer) {
+        const { insertedCount, skippedCount } = appendUploadedAssetsToComposer(items);
+        if (insertedCount === 0 && skippedCount > 0) {
+          setPickerError('同一条消息最多可引用 9 张图片素材');
+        } else if (skippedCount > 0) {
+          setPickerError(`已上传 ${items.length} 张，自动插入 ${insertedCount} 张（最多 9 张）`);
+        } else {
+          setPickerError('');
+        }
+      } else {
+        setPickerError('');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : '上传失败';
       setPickerError(message);
     } finally {
       setPickerUploading(false);
+    }
+  }
+
+  function handleComposerDragEnter(event: ReactDragEvent<HTMLDivElement>) {
+    if (!hasImageDataTransfer(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerDragDepthRef.current += 1;
+    if (!composerDropUploading) {
+      setComposerDropActive(true);
+    }
+  }
+
+  function handleComposerDragOver(event: ReactDragEvent<HTMLDivElement>) {
+    if (!hasImageDataTransfer(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    if (!composerDropUploading) {
+      setComposerDropActive(true);
+    }
+  }
+
+  function handleComposerDragLeave(event: ReactDragEvent<HTMLDivElement>) {
+    if (!hasImageDataTransfer(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerDragDepthRef.current = Math.max(0, composerDragDepthRef.current - 1);
+    if (composerDragDepthRef.current === 0) {
+      setComposerDropActive(false);
+    }
+  }
+
+  async function handleComposerDrop(event: ReactDragEvent<HTMLDivElement>) {
+    if (!hasImageDataTransfer(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerDragDepthRef.current = 0;
+    setComposerDropActive(false);
+
+    const files = collectImageFiles(event.dataTransfer.files);
+    if (files.length === 0 || composerDropUploading) {
+      return;
+    }
+
+    setComposerDropUploading(true);
+    try {
+      await handleMentionUpload(files, { autoInsertToComposer: true });
+    } finally {
+      setComposerDropUploading(false);
     }
   }
 
@@ -841,10 +999,17 @@ export function ComposerDock({
       <Box
         sx={{
           borderRadius: 0.8,
-          border: '1px solid rgba(0,0,0,0.08)',
+          border: composerDropActive || composerDropUploading
+            ? '1px solid rgba(138,91,53,0.44)'
+            : '1px solid rgba(0,0,0,0.08)',
           bgcolor: 'rgba(255,255,255,0.95)',
           backdropFilter: 'blur(10px)',
           p: { xs: 1.5, md: 2 },
+          transform: composerDropActive || composerDropUploading ? 'translateY(-4px)' : 'translateY(0)',
+          transition: 'transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease',
+          boxShadow: composerDropActive || composerDropUploading
+            ? '0 14px 28px rgba(122, 84, 50, 0.2)'
+            : 'none',
         }}
       >
         <Stack direction="row" alignItems="center" spacing={0.8}>
@@ -873,8 +1038,32 @@ export function ComposerDock({
           </IconButton>
         </Stack>
 
-        <Box sx={{ mt: 1.5 }}>
-          <Box sx={{ display: 'grid', minHeight: 74 }}>
+        <Box
+          sx={{ mt: 1.5, position: 'relative' }}
+          onDragEnter={handleComposerDragEnter}
+          onDragOver={handleComposerDragOver}
+          onDragLeave={handleComposerDragLeave}
+          onDrop={(event) => {
+            void handleComposerDrop(event);
+          }}
+        >
+          <Box
+            sx={{
+              display: 'grid',
+              minHeight: 74,
+              position: 'relative',
+              borderRadius: 1.2,
+              px: 0.8,
+              py: 0.7,
+              bgcolor: composerDropActive || composerDropUploading
+                ? 'rgba(138, 91, 53, 0.07)'
+                : 'transparent',
+              outline: composerDropActive || composerDropUploading
+                ? '1.5px dashed rgba(138, 91, 53, 0.45)'
+                : 'none',
+              transition: 'background-color 120ms ease, outline-color 120ms ease',
+            }}
+          >
             <Box
               aria-hidden
               sx={{
@@ -947,6 +1136,29 @@ export function ComposerDock({
               }}
             />
           </Box>
+
+          {composerDropActive || composerDropUploading ? (
+            <Box
+              sx={{
+                position: 'absolute',
+                inset: 0,
+                borderRadius: 1.2,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                pointerEvents: 'none',
+                zIndex: 3,
+                bgcolor: 'rgba(247, 239, 231, 0.86)',
+              }}
+            >
+              <Stack spacing={0.7} alignItems="center" sx={{ color: '#6f4d2f' }}>
+                {composerDropUploading ? <CircularProgress size={20} /> : <AttachFileRoundedIcon sx={{ fontSize: 22 }} />}
+                <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                  {composerDropUploading ? '正在上传并插入当前消息...' : '松手上传并自动插入当前消息'}
+                </Typography>
+              </Stack>
+            </Box>
+          ) : null}
 
           <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mt: 0.6 }}>
             {references.map((refItem) => (
