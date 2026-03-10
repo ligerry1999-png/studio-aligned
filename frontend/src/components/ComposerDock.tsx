@@ -109,6 +109,11 @@ interface TextTemplateItem {
   content: string;
 }
 
+interface ComposerInsertionAnchor {
+  start: number;
+  end: number;
+}
+
 const PARAM_SELECT_BASE_SX = {
   height: 30,
   borderRadius: 1.8,
@@ -238,15 +243,12 @@ interface HighlightSegment {
   content: string;
   highlighted: boolean;
   objectToken?: boolean;
-  mentionThumbnailUrl?: string;
-  mentionTitle?: string;
+  mentionToken?: boolean;
 }
 
 function splitComposerTextByMentions(
   text: string,
   highlightedSlots: Set<string>,
-  referenceBySlot: Map<string, ComposerReference>,
-  mentionAssetMap: Map<string, StudioAsset>,
 ): HighlightSegment[] {
   if (!text) return [{ content: '', highlighted: false }];
   const segments: HighlightSegment[] = [];
@@ -261,14 +263,10 @@ function splitComposerTextByMentions(
     }
     if (token.startsWith('@')) {
       const slot = token.slice(1);
-      const ref = referenceBySlot.get(slot);
-      const matchedAsset = ref ? mentionAssetMap.get(String(ref.asset_id || '')) : undefined;
-      const thumb = resolveAssetUrl(String(matchedAsset?.thumbnail_url || matchedAsset?.file_url || ''));
       segments.push({
         content: token,
         highlighted: highlightedSlots.has(slot),
-        mentionThumbnailUrl: thumb || undefined,
-        mentionTitle: ref?.asset_title || matchedAsset?.title || ref?.asset_id || slot,
+        mentionToken: true,
       });
     } else {
       segments.push({ content: token, highlighted: true, objectToken: true });
@@ -644,20 +642,10 @@ export function ComposerDock({
     });
     return map;
   }, [generatedCandidates, officialAssets, savedCandidates, staticCandidates, uploadCandidates]);
-  const referenceBySlot = useMemo(() => {
-    const map = new Map<string, ComposerReference>();
-    references.forEach((ref) => {
-      const slot = String(ref.slot || '').trim();
-      if (!slot) return;
-      map.set(slot, ref);
-    });
-    return map;
-  }, [references]);
-
   const highlightedSlots = useMemo(() => new Set(references.map((ref) => ref.slot)), [references]);
   const composerHighlightSegments = useMemo(
-    () => splitComposerTextByMentions(text, highlightedSlots, referenceBySlot, mentionAssetMap),
-    [highlightedSlots, mentionAssetMap, referenceBySlot, text],
+    () => splitComposerTextByMentions(text, highlightedSlots),
+    [highlightedSlots, text],
   );
 
   const closePicker = useCallback(() => {
@@ -763,14 +751,19 @@ export function ComposerDock({
     [closePicker, mentionStart, onTextChange, text],
   );
 
-  const appendUploadedAssetsToComposer = useCallback((assets: StudioAsset[]) => {
+  const appendUploadedAssetsToComposer = useCallback((
+    assets: StudioAsset[],
+    insertionAnchor?: ComposerInsertionAnchor,
+  ) => {
     if (assets.length === 0) {
       return { insertedCount: 0, skippedCount: 0 };
     }
 
-    let nextText = latestTextRef.current;
+    const currentText = latestTextRef.current;
+    let nextText = currentText;
     let nextReferences = [...latestReferencesRef.current];
     let insertedCount = 0;
+    const insertedTokens: string[] = [];
 
     for (const asset of assets) {
       if (!asset.id) continue;
@@ -782,9 +775,7 @@ export function ComposerDock({
       if (!slot) break;
 
       const token = `@${slot}`;
-      nextText = nextText
-        ? `${nextText}${/\s$/.test(nextText) ? '' : ' '}${token} `
-        : `${token} `;
+      insertedTokens.push(token);
       nextReferences.push({
         mention_id: `mention-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         slot,
@@ -797,12 +788,36 @@ export function ComposerDock({
     }
 
     if (insertedCount > 0) {
+      const normalizedStart = Math.max(0, Math.min(
+        Number.isFinite(insertionAnchor?.start) ? Number(insertionAnchor?.start) : currentText.length,
+        currentText.length,
+      ));
+      const normalizedEnd = Math.max(
+        normalizedStart,
+        Math.min(
+          Number.isFinite(insertionAnchor?.end) ? Number(insertionAnchor?.end) : normalizedStart,
+          currentText.length,
+        ),
+      );
+      const left = currentText.slice(0, normalizedStart);
+      const right = currentText.slice(normalizedEnd);
+      let insertedText = insertedTokens.join(' ');
+      if (left.trim().length > 0 && !/[\s\n]$/.test(left)) {
+        insertedText = ` ${insertedText}`;
+      }
+      if (right.trim().length > 0 && !/^[\s\n]/.test(right)) {
+        insertedText = `${insertedText} `;
+      } else {
+        insertedText = `${insertedText} `;
+      }
+      nextText = `${left}${insertedText}${right}`;
+
       onTextChange(nextText);
       onReferencesChange(nextReferences);
       window.setTimeout(() => {
         const target = textareaRef.current;
         if (!target) return;
-        const cursor = nextText.length;
+        const cursor = left.length + insertedText.length;
         target.focus();
         target.setSelectionRange(cursor, cursor);
       }, 0);
@@ -854,7 +869,13 @@ export function ComposerDock({
     [mentionAssetMap],
   );
 
-  async function handleMentionUpload(files: File[], options?: { autoInsertToComposer?: boolean }) {
+  async function handleMentionUpload(
+    files: File[],
+    options?: {
+      autoInsertToComposer?: boolean;
+      insertionAnchor?: ComposerInsertionAnchor;
+    },
+  ) {
     const imageFiles = collectImageFiles(files);
     if (imageFiles.length === 0) {
       if (files.length > 0) {
@@ -869,7 +890,7 @@ export function ComposerDock({
       setPickerUploads((prev) => dedupeById(items.concat(prev)));
       setPickerSource('upload');
       if (options?.autoInsertToComposer) {
-        const { insertedCount, skippedCount } = appendUploadedAssetsToComposer(items);
+        const { insertedCount, skippedCount } = appendUploadedAssetsToComposer(items, options.insertionAnchor);
         if (insertedCount === 0 && skippedCount > 0) {
           setPickerError('同一条消息最多可引用 9 张图片素材');
         } else if (skippedCount > 0) {
@@ -943,6 +964,8 @@ export function ComposerDock({
     if (files.length === 0) {
       return;
     }
+    const anchorStart = event.currentTarget.selectionStart ?? text.length;
+    const anchorEnd = event.currentTarget.selectionEnd ?? anchorStart;
     event.preventDefault();
     event.stopPropagation();
 
@@ -955,7 +978,10 @@ export function ComposerDock({
     setComposerDropActive(false);
     composerDragDepthRef.current = 0;
     try {
-      await handleMentionUpload(files, { autoInsertToComposer: true });
+      await handleMentionUpload(files, {
+        autoInsertToComposer: true,
+        insertionAnchor: { start: anchorStart, end: anchorEnd },
+      });
     } finally {
       setComposerDropUploading(false);
     }
@@ -1384,59 +1410,27 @@ export function ComposerDock({
               }}
             >
               {composerHighlightSegments.map((segment, idx) => (
-                segment.mentionThumbnailUrl ? (
-                  <Box
-                    key={`${segment.content}-${idx}`}
-                    component="span"
-                    sx={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 0.45,
-                      px: 0.45,
-                      py: 0.1,
-                      mr: 0.25,
-                      borderRadius: 0.8,
-                      bgcolor: segment.highlighted ? 'rgba(195, 132, 76, 0.18)' : 'rgba(62, 100, 168, 0.12)',
-                      border: segment.highlighted ? '1px solid rgba(195, 132, 76, 0.36)' : '1px solid rgba(62, 100, 168, 0.24)',
-                      color: '#2e4f7e',
-                      verticalAlign: 'middle',
-                      boxDecorationBreak: 'clone',
-                      WebkitBoxDecorationBreak: 'clone',
-                    }}
-                  >
-                    <Box
-                      component="img"
-                      src={segment.mentionThumbnailUrl}
-                      alt={segment.mentionTitle || segment.content}
-                      sx={{
-                        width: 17,
-                        height: 17,
-                        borderRadius: 0.5,
-                        objectFit: 'cover',
-                        display: 'block',
-                        border: '1px solid rgba(87, 122, 186, 0.3)',
-                        flexShrink: 0,
-                      }}
-                    />
-                    <Box component="span" sx={{ fontWeight: 600 }}>
-                      {segment.content}
-                    </Box>
-                  </Box>
-                ) : (
-                  <Box
-                    key={`${segment.content}-${idx}`}
-                    component="span"
-                    sx={segment.highlighted ? {
-                      bgcolor: segment.objectToken ? 'rgba(123, 165, 120, 0.24)' : 'rgba(195, 132, 76, 0.26)',
-                      color: segment.objectToken ? '#2f5f34' : '#6d4423',
-                      borderRadius: 0.8,
-                      boxDecorationBreak: 'clone',
-                      WebkitBoxDecorationBreak: 'clone',
-                    } : undefined}
-                  >
-                    {segment.content}
-                  </Box>
-                )
+                <Box
+                  key={`${segment.content}-${idx}`}
+                  component="span"
+                  sx={segment.highlighted ? {
+                    bgcolor: segment.objectToken
+                      ? 'rgba(123, 165, 120, 0.24)'
+                      : segment.mentionToken
+                        ? 'rgba(62, 100, 168, 0.18)'
+                        : 'rgba(195, 132, 76, 0.26)',
+                    color: segment.objectToken
+                      ? '#2f5f34'
+                      : segment.mentionToken
+                        ? '#2e4f7e'
+                        : '#6d4423',
+                    borderRadius: 0.8,
+                    boxDecorationBreak: 'clone',
+                    WebkitBoxDecorationBreak: 'clone',
+                  } : undefined}
+                >
+                  {segment.content}
+                </Box>
               ))}
               {text.length === 0 ? <Box component="span" sx={{ color: '#8f857a' }}>{mentionComposerPlaceholder}</Box> : null}
             </Box>
