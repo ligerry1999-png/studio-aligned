@@ -600,6 +600,7 @@ export function StudioPage() {
   const [pendingTurnsByWorkspace, setPendingTurnsByWorkspace] = useState<Record<string, PendingTurn[]>>({});
   const [textStreamingCountByWorkspace, setTextStreamingCountByWorkspace] = useState<Record<string, number>>({});
   const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
+  const [composerDockHeight, setComposerDockHeight] = useState<number>(0);
   const currentWorkspaceIdRef = useRef<string | null>(null);
   const currentWorkspaceRef = useRef<WorkspaceDetail | null>(null);
   const objectNameMapRef = useRef<Record<string, Record<string, string>>>({});
@@ -946,6 +947,10 @@ export function StudioPage() {
       messages: currentWorkspace.messages.concat(pendingMessagesForCurrentWorkspace),
     };
   }, [currentWorkspace, pendingMessagesForCurrentWorkspace]);
+  const chatBottomSpacerHeight = useMemo(() => {
+    const baseGap = 24;
+    return Math.max(0, composerDockHeight + baseGap);
+  }, [composerDockHeight]);
 
   const isCurrentWorkspaceSending = useMemo(() => {
     if (!currentWorkspace) return false;
@@ -1961,7 +1966,7 @@ export function StudioPage() {
               
               {/* Workspace Content + Floating Composer */}
               <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
-                <Box sx={{ height: '100%', minHeight: 0, pb: { xs: '20px', md: '16px' } }}>
+                <Box sx={{ height: '100%', minHeight: 0 }}>
                   <ChatThread
                     workspace={displayWorkspace}
                     onOpenAsset={(asset) => setLightboxAsset(asset)}
@@ -1974,6 +1979,7 @@ export function StudioPage() {
                     onSelectTextPromptOption={(payload) => {
                       void handleSelectTextPromptOption(payload);
                     }}
+                    bottomSpacerHeight={chatBottomSpacerHeight}
                   />
                 </Box>
 
@@ -2018,6 +2024,9 @@ export function StudioPage() {
                   onAnnotateReference={handleAnnotateReference}
                   onSend={() => {
                     void handleSendTurn();
+                  }}
+                  onDockHeightChange={(height) => {
+                    setComposerDockHeight((prev) => (prev === height ? prev : height));
                   }}
                 />
               </Box>

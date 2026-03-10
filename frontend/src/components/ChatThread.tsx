@@ -25,6 +25,7 @@ interface ChatThreadProps {
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
   onGenerateTextPromptImage: (payload: TextPromptImageSelectionPayload) => void;
   onSelectTextPromptOption: (payload: TextPromptOptionSelectionPayload) => void;
+  bottomSpacerHeight?: number;
 }
 
 type TaskStatus = 'completed' | 'running' | 'failed';
@@ -870,7 +871,14 @@ function TaskCard({
   );
 }
 
-export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTextPromptImage, onSelectTextPromptOption }: ChatThreadProps) {
+export function ChatThread({
+  workspace,
+  onOpenAsset,
+  onImageAction,
+  onGenerateTextPromptImage,
+  onSelectTextPromptOption,
+  bottomSpacerHeight = 0,
+}: ChatThreadProps) {
   const messages = workspace?.messages;
   const tasks = useMemo(() => mergeMessagesToTasks(messages || []), [messages]);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -918,6 +926,7 @@ export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTe
             onSelectTextPromptOption={onSelectTextPromptOption}
           />
         ))}
+        {bottomSpacerHeight > 0 ? <Box sx={{ height: `${Math.ceil(bottomSpacerHeight)}px` }} /> : null}
       </Stack>
     </Box>
   );

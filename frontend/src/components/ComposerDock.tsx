@@ -100,6 +100,7 @@ interface ComposerDockProps {
   onConsumeInsertAssetRequest: () => void;
   onAnnotateReference: (reference: ComposerReference) => void;
   onSend: () => void;
+  onDockHeightChange?: (height: number) => void;
 }
 
 interface TextTemplateItem {
@@ -401,8 +402,10 @@ export function ComposerDock({
   onConsumeInsertAssetRequest,
   onAnnotateReference,
   onSend,
+  onDockHeightChange,
 }: ComposerDockProps) {
   const dockRootRef = useRef<HTMLDivElement | null>(null);
+  const lastDockHeightRef = useRef(-1);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const mentionUploadRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -483,6 +486,50 @@ export function ComposerDock({
   useEffect(() => {
     latestReferencesRef.current = references;
   }, [references]);
+
+  useEffect(() => {
+    const node = dockRootRef.current;
+    if (!node) {
+      if (onDockHeightChange && lastDockHeightRef.current !== 0) {
+        lastDockHeightRef.current = 0;
+        onDockHeightChange(0);
+      }
+      return;
+    }
+
+    const emitHeight = () => {
+      if (!onDockHeightChange) return;
+      const nextHeight = Math.max(0, Math.ceil(node.getBoundingClientRect().height));
+      if (nextHeight === lastDockHeightRef.current) return;
+      lastDockHeightRef.current = nextHeight;
+      onDockHeightChange(nextHeight);
+    };
+
+    emitHeight();
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => {
+        emitHeight();
+      });
+      observer.observe(node);
+      return () => {
+        observer.disconnect();
+        if (onDockHeightChange && lastDockHeightRef.current !== 0) {
+          lastDockHeightRef.current = 0;
+          onDockHeightChange(0);
+        }
+      };
+    }
+
+    const handleResize = () => emitHeight();
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (onDockHeightChange && lastDockHeightRef.current !== 0) {
+        lastDockHeightRef.current = 0;
+        onDockHeightChange(0);
+      }
+    };
+  }, [onDockHeightChange]);
 
   const uploadCandidates = useMemo(
     () => dedupeById(pickerUploads.concat(uploadAssets)),
