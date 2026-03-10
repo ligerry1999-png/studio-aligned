@@ -2135,10 +2135,37 @@ class StudioService:
             normalized.append(context)
         return normalized
 
-    def _annotation_contexts_to_prompt(self, contexts: List[Dict[str, Any]]) -> str:
+    def _references_to_prompt(self, references: List[Dict[str, Any]]) -> str:
+        if not isinstance(references, list) or len(references) == 0:
+            return ""
+        lines = ["[参考图映射]"]
+        ordered = sorted(
+            [item for item in references if isinstance(item, dict)],
+            key=lambda x: int(x.get("order") or 0),
+        )
+        for idx, ref in enumerate(ordered, start=1):
+            slot = str(ref.get("slot") or "").strip()
+            aid = str(ref.get("asset_id") or "").strip()
+            title = str(ref.get("asset_title") or "").strip()
+            slot_label = f"@{slot}" if slot else f"第{idx}张参考图"
+            extra_parts: List[str] = []
+            if idx == 1:
+                extra_parts.append("默认主底图")
+            if title:
+                extra_parts.append(f"title={title}")
+            if aid:
+                extra_parts.append(f"asset_id={aid}")
+            extra = f"（{'，'.join(extra_parts)}）" if extra_parts else ""
+            lines.append(f"- {slot_label} = 第{idx}张参考图{extra}")
+        lines.append("- 严格按 @图N 与“第N张参考图”的对应关系理解，不要互换。")
+        lines.append("- 除非用户明确指定其他底图，否则默认以 @图1 为主体构图。")
+        return "\n".join(lines)
+
+    def _annotation_contexts_to_prompt(self, contexts: List[Dict[str, Any]], asset_slot_map: Optional[Dict[str, str]] = None) -> str:
         if not isinstance(contexts, list) or len(contexts) == 0:
             return ""
         lines = ["[标注上下文]"]
+        mapping = asset_slot_map if isinstance(asset_slot_map, dict) else {}
         for ctx_index, context in enumerate(contexts, start=1):
             if not isinstance(context, dict):
                 continue
@@ -2146,7 +2173,13 @@ class StudioService:
             if not isinstance(objects, list) or len(objects) == 0:
                 continue
             asset_id = str(context.get("asset_id") or "").strip()
-            if asset_id:
+            slot = str(mapping.get(asset_id) or "").strip()
+            slot_label = f"@{slot}" if slot else ""
+            if asset_id and slot_label:
+                lines.append(f"- 图片{ctx_index} ({slot_label}, asset_id={asset_id})")
+            elif slot_label:
+                lines.append(f"- 图片{ctx_index} ({slot_label})")
+            elif asset_id:
                 lines.append(f"- 图片{ctx_index} (asset_id={asset_id})")
             else:
                 lines.append(f"- 图片{ctx_index}")
@@ -2396,12 +2429,20 @@ class StudioService:
             if annotation_asset_id and annotation_asset_id not in valid_attachment_ids and self._resolve_asset(annotation_asset_id):
                 valid_attachment_ids.append(annotation_asset_id)
         composed_text = (text or "").strip()
-        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts)
-        if annotation_prompt:
+        asset_slot_map = {
+            str(item.get("asset_id") or "").strip(): str(item.get("slot") or "").strip()
+            for item in valid_references
+            if isinstance(item, dict)
+        }
+        reference_prompt = self._references_to_prompt(valid_references)
+        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts, asset_slot_map=asset_slot_map)
+        prefix_blocks = [item for item in [reference_prompt, annotation_prompt] if item]
+        if prefix_blocks:
+            prefix_text = "\n\n".join(prefix_blocks)
             if composed_text:
-                composed_text = f"{annotation_prompt}\n\n原始需求:\n{composed_text}"
+                composed_text = f"{prefix_text}\n\n原始需求:\n{composed_text}"
             else:
-                composed_text = annotation_prompt
+                composed_text = prefix_text
         user_msg = {
             "id": f"msg-{uuid.uuid4().hex[:10]}",
             "role": "user",
@@ -2534,12 +2575,20 @@ class StudioService:
 
         raw_text = (text or "").strip()
         composed_text = raw_text
-        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts)
-        if annotation_prompt:
+        asset_slot_map = {
+            str(item.get("asset_id") or "").strip(): str(item.get("slot") or "").strip()
+            for item in valid_references
+            if isinstance(item, dict)
+        }
+        reference_prompt = self._references_to_prompt(valid_references)
+        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts, asset_slot_map=asset_slot_map)
+        prefix_blocks = [item for item in [reference_prompt, annotation_prompt] if item]
+        if prefix_blocks:
+            prefix_text = "\n\n".join(prefix_blocks)
             if composed_text:
-                composed_text = f"{annotation_prompt}\n\n原始需求:\n{composed_text}"
+                composed_text = f"{prefix_text}\n\n原始需求:\n{composed_text}"
             else:
-                composed_text = annotation_prompt
+                composed_text = prefix_text
         if prompt_pack_mode == TEXT_PROMPT_PACK_MODE:
             structure_instruction = _stepped_prompt_json_instruction(
                 prompt_pack_stage,
