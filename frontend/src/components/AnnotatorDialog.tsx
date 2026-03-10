@@ -22,6 +22,8 @@ interface AnnotatorDialogProps {
   initialSnapshot?: Record<string, unknown> | null;
   onClose: () => void;
   onContextChange?: (context: AnnotationDraftContext) => void;
+  backdropZIndex?: number;
+  frameZIndex?: number;
 }
 
 interface ExtractedAnnotationContext extends AnnotationDraftContext {
@@ -183,6 +185,8 @@ export function AnnotatorDialog({
   initialSnapshot = null,
   onClose,
   onContextChange,
+  backdropZIndex = 140,
+  frameZIndex = 170,
 }: AnnotatorDialogProps) {
   const editorRef = useRef<Editor | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
@@ -310,182 +314,185 @@ export function AnnotatorDialog({
   const frameHeight = `min(calc((100vw - 120px) / ${normalizedRatio}), calc(100vh - 220px))`;
 
   return (
-    <Box
-      sx={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 130,
-        pointerEvents: 'none',
-      }}
-    >
+    <>
       <Box
-        onMouseDown={() => {
-          closeDialog();
-        }}
         sx={{
-          position: 'absolute',
+          position: 'fixed',
           inset: 0,
+          zIndex: backdropZIndex,
           bgcolor: 'rgba(0,0,0,0.44)',
           pointerEvents: 'auto',
+        }}
+        onMouseDown={() => {
+          closeDialog();
         }}
       />
 
       <Box
-        onMouseDown={(event) => {
-          event.stopPropagation();
-        }}
         sx={{
-          position: 'absolute',
-          left: '50%',
-          top: 'calc(50% - 52px)',
-          transform: 'translate(-50%, -50%)',
-          width: frameWidth,
-          height: frameHeight,
-          minHeight: 260,
-          borderRadius: 2,
-          overflow: 'hidden',
-          border: '1px solid rgba(255,255,255,0.26)',
-          bgcolor: 'transparent',
-          boxShadow: '0 24px 56px rgba(0,0,0,0.24)',
-          pointerEvents: 'auto',
+          position: 'fixed',
+          inset: 0,
+          zIndex: frameZIndex,
+          pointerEvents: 'none',
         }}
       >
-        {hint ? (
+        <Box
+          onMouseDown={(event) => {
+            event.stopPropagation();
+          }}
+          sx={{
+            position: 'absolute',
+            left: '50%',
+            top: 'calc(50% - 52px)',
+            transform: 'translate(-50%, -50%)',
+            width: frameWidth,
+            height: frameHeight,
+            minHeight: 260,
+            borderRadius: 2,
+            overflow: 'hidden',
+            border: '1px solid rgba(255,255,255,0.26)',
+            bgcolor: 'transparent',
+            boxShadow: '0 24px 56px rgba(0,0,0,0.24)',
+            pointerEvents: 'auto',
+          }}
+        >
+          {hint ? (
+            <Box
+              sx={{
+                position: 'absolute',
+                left: 12,
+                top: 12,
+                zIndex: 4,
+                px: 1,
+                py: 0.45,
+                borderRadius: 1,
+                bgcolor: 'rgba(255,255,255,0.9)',
+              }}
+            >
+              <Typography variant="caption" sx={{ color: '#5c4634', fontWeight: 700 }}>
+                {hint}
+              </Typography>
+            </Box>
+          ) : null}
+
+          <Stack
+            spacing={0.7}
+            sx={{
+              position: 'absolute',
+              right: { xs: 10, md: 16 },
+              top: '50%',
+              transform: 'translateY(-50%)',
+              p: 0.65,
+              borderRadius: 99,
+              bgcolor: 'rgba(255,255,255,0.94)',
+              border: '1px solid rgba(0,0,0,0.08)',
+              boxShadow: '0 10px 24px rgba(0,0,0,0.12)',
+              zIndex: 4,
+            }}
+          >
+            <Tooltip title="返回" placement="left">
+              <span>
+                <IconButton
+                  onClick={closeDialog}
+                  sx={{ width: 38, height: 38, color: '#6f6254' }}
+                >
+                  <ArrowBackRoundedIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="矩形" placement="left">
+              <IconButton
+                onClick={() => applyTool('rectangle')}
+                sx={{
+                  width: 38,
+                  height: 38,
+                  color: activeTool === 'rectangle' ? '#8b5f3b' : '#6f6254',
+                  bgcolor: activeTool === 'rectangle' ? 'rgba(139,95,59,0.12)' : 'transparent',
+                }}
+              >
+                <RectangleOutlinedIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="箭头" placement="left">
+              <IconButton
+                onClick={() => applyTool('arrow')}
+                sx={{
+                  width: 38,
+                  height: 38,
+                  color: activeTool === 'arrow' ? '#8b5f3b' : '#6f6254',
+                  bgcolor: activeTool === 'arrow' ? 'rgba(139,95,59,0.12)' : 'transparent',
+                }}
+              >
+                <NorthEastRoundedIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="删除" placement="left">
+              <IconButton onClick={deleteSelected} sx={{ width: 38, height: 38, color: '#b94747' }}>
+                <DeleteOutlineRoundedIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          </Stack>
+
+          <Box
+            component="img"
+            src={resolveAssetUrl(asset.file_url || asset.thumbnail_url)}
+            alt={asset.title || 'annotate'}
+            sx={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'fill',
+              pointerEvents: 'none',
+            }}
+          />
           <Box
             sx={{
               position: 'absolute',
-              left: 12,
-              top: 12,
-              zIndex: 4,
-              px: 1,
-              py: 0.45,
-              borderRadius: 1,
-              bgcolor: 'rgba(255,255,255,0.9)',
+              inset: 0,
+              '& .tl-background': { backgroundColor: 'transparent !important' },
+              '& .tl-canvas': { backgroundColor: 'transparent !important' },
             }}
           >
-            <Typography variant="caption" sx={{ color: '#5c4634', fontWeight: 700 }}>
-              {hint}
-            </Typography>
-          </Box>
-        ) : null}
+            <Tldraw
+              key={`${asset.id || 'empty'}-${open ? 'open' : 'close'}`}
+              snapshot={snapshot}
+              hideUi
+              onMount={(editor) => {
+                editorRef.current = editor;
+                setActiveTool('rectangle');
+                editor.run(() => {
+                  editor.setStyleForNextShapes(GeoShapeGeoStyle, 'rectangle');
+                  editor.setStyleForNextShapes(DefaultColorStyle, 'red');
+                  editor.updateInstanceState({ isToolLocked: true });
+                  editor.setCurrentTool('geo');
+                });
 
-        <Stack
-          spacing={0.7}
-          sx={{
-            position: 'absolute',
-            right: { xs: 10, md: 16 },
-            top: '50%',
-            transform: 'translateY(-50%)',
-            p: 0.65,
-            borderRadius: 99,
-            bgcolor: 'rgba(255,255,255,0.94)',
-            border: '1px solid rgba(0,0,0,0.08)',
-            boxShadow: '0 10px 24px rgba(0,0,0,0.12)',
-            zIndex: 4,
-          }}
-        >
-          <Tooltip title="返回" placement="left">
-            <span>
-              <IconButton
-                onClick={closeDialog}
-                sx={{ width: 38, height: 38, color: '#6f6254' }}
-              >
-                <ArrowBackRoundedIcon fontSize="small" />
-              </IconButton>
-            </span>
-          </Tooltip>
-          <Tooltip title="矩形" placement="left">
-            <IconButton
-              onClick={() => applyTool('rectangle')}
-              sx={{
-                width: 38,
-                height: 38,
-                color: activeTool === 'rectangle' ? '#8b5f3b' : '#6f6254',
-                bgcolor: activeTool === 'rectangle' ? 'rgba(139,95,59,0.12)' : 'transparent',
-              }}
-            >
-              <RectangleOutlinedIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="箭头" placement="left">
-            <IconButton
-              onClick={() => applyTool('arrow')}
-              sx={{
-                width: 38,
-                height: 38,
-                color: activeTool === 'arrow' ? '#8b5f3b' : '#6f6254',
-                bgcolor: activeTool === 'arrow' ? 'rgba(139,95,59,0.12)' : 'transparent',
-              }}
-            >
-              <NorthEastRoundedIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="删除" placement="left">
-            <IconButton onClick={deleteSelected} sx={{ width: 38, height: 38, color: '#b94747' }}>
-              <DeleteOutlineRoundedIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-        </Stack>
-
-        <Box
-          component="img"
-          src={resolveAssetUrl(asset.file_url || asset.thumbnail_url)}
-          alt={asset.title || 'annotate'}
-          sx={{
-            position: 'absolute',
-            inset: 0,
-            width: '100%',
-            height: '100%',
-            objectFit: 'fill',
-            pointerEvents: 'none',
-          }}
-        />
-        <Box
-          sx={{
-            position: 'absolute',
-            inset: 0,
-            '& .tl-background': { backgroundColor: 'transparent !important' },
-            '& .tl-canvas': { backgroundColor: 'transparent !important' },
-          }}
-        >
-          <Tldraw
-            key={`${asset.id || 'empty'}-${open ? 'open' : 'close'}`}
-            snapshot={snapshot}
-            hideUi
-            onMount={(editor) => {
-              editorRef.current = editor;
-              setActiveTool('rectangle');
-              editor.run(() => {
-                editor.setStyleForNextShapes(GeoShapeGeoStyle, 'rectangle');
-                editor.setStyleForNextShapes(DefaultColorStyle, 'red');
-                editor.updateInstanceState({ isToolLocked: true });
-                editor.setCurrentTool('geo');
-              });
-
-              if (cleanupRef.current) {
-                cleanupRef.current();
-                cleanupRef.current = null;
-              }
-              const listener = (editor.store as unknown as { listen?: (...args: unknown[]) => unknown }).listen;
-              if (typeof listener === 'function') {
-                const rawCleanup = listener.call(editor.store, () => {
-                  emitContext();
-                }, { scope: 'document' });
-                if (typeof rawCleanup === 'function') {
-                  cleanupRef.current = rawCleanup as () => void;
-                } else if (rawCleanup && typeof (rawCleanup as { unsubscribe?: () => void }).unsubscribe === 'function') {
-                  cleanupRef.current = () => {
-                    (rawCleanup as { unsubscribe?: () => void }).unsubscribe?.();
-                  };
+                if (cleanupRef.current) {
+                  cleanupRef.current();
+                  cleanupRef.current = null;
                 }
-              }
+                const listener = (editor.store as unknown as { listen?: (...args: unknown[]) => unknown }).listen;
+                if (typeof listener === 'function') {
+                  const rawCleanup = listener.call(editor.store, () => {
+                    emitContext();
+                  }, { scope: 'document' });
+                  if (typeof rawCleanup === 'function') {
+                    cleanupRef.current = rawCleanup as () => void;
+                  } else if (rawCleanup && typeof (rawCleanup as { unsubscribe?: () => void }).unsubscribe === 'function') {
+                    cleanupRef.current = () => {
+                      (rawCleanup as { unsubscribe?: () => void }).unsubscribe?.();
+                    };
+                  }
+                }
 
-              emitContext();
-            }}
-            autoFocus={false}
-          />
+                emitContext();
+              }}
+              autoFocus={false}
+            />
+          </Box>
         </Box>
       </Box>
-    </Box>
+    </>
   );
 }

@@ -101,6 +101,7 @@ interface ComposerDockProps {
   onAnnotateReference: (reference: ComposerReference) => void;
   onSend: () => void;
   onDockHeightChange?: (height: number) => void;
+  zIndex?: number;
 }
 
 interface TextTemplateItem {
@@ -401,6 +402,7 @@ export function ComposerDock({
   onAnnotateReference,
   onSend,
   onDockHeightChange,
+  zIndex,
 }: ComposerDockProps) {
   const dockRootRef = useRef<HTMLDivElement | null>(null);
   const lastDockHeightRef = useRef(-1);
@@ -1324,7 +1326,7 @@ export function ComposerDock({
         left: '50%',
         transform: 'translateX(-50%)',
         width: 'min(800px, calc(100% - 24px))',
-        zIndex: annotationActive ? 180 : 100,
+        zIndex: zIndex ?? (annotationActive ? 180 : 100),
       }}
     >
       {pickerPanel}

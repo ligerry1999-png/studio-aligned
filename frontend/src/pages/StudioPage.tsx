@@ -75,6 +75,10 @@ interface ImageTurnRequest {
 }
 
 const MAX_MATERIAL_UNITS = 9;
+const Z_INDEX_COMPOSER_DEFAULT = 100;
+const Z_INDEX_ANNOTATOR_BACKDROP = 140;
+const Z_INDEX_COMPOSER_WITH_ANNOTATOR = 160;
+const Z_INDEX_ANNOTATOR_FRAME = 170;
 const OBJECT_LABELS: string[] = Array.from({ length: MAX_MATERIAL_UNITS }, (_, index) => `对象${index + 1}`);
 const SYSTEM_OBJECT_LINE_REGEX = /^\s*(?:将)?【对象([1-9])】里的「([^」]*)」(?:移动到【对象([1-9])】)?(.*)$/;
 
@@ -2053,6 +2057,7 @@ export function StudioPage() {
                   onDockHeightChange={(height) => {
                     setComposerDockHeight((prev) => (prev === height ? prev : height));
                   }}
+                  zIndex={annotatorTarget ? Z_INDEX_COMPOSER_WITH_ANNOTATOR : Z_INDEX_COMPOSER_DEFAULT}
                 />
               </Box>
             </Box>
@@ -2088,6 +2093,8 @@ export function StudioPage() {
         initialSnapshot={null}
         onClose={() => setAnnotatorTarget(null)}
         onContextChange={handleAnnotationContextChange}
+        backdropZIndex={Z_INDEX_ANNOTATOR_BACKDROP}
+        frameZIndex={Z_INDEX_ANNOTATOR_FRAME}
       />
 
       <ApiSettingsDialog
