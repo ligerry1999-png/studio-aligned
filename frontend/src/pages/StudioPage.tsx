@@ -81,6 +81,7 @@ const Z_INDEX_COMPOSER_WITH_ANNOTATOR = 160;
 const Z_INDEX_ANNOTATOR_FRAME = 170;
 const OBJECT_LABELS: string[] = Array.from({ length: MAX_MATERIAL_UNITS }, (_, index) => `对象${index + 1}`);
 const SYSTEM_OBJECT_LINE_REGEX = /^\s*(?:将)?【对象([1-9])】里的「([^」]*)」(?:移动到【对象([1-9])】)?(.*)$/;
+const ORPHAN_MOVE_SUFFIX_LINE_REGEX = /^[，,、]\s*(?:放到|移到|移动到)\s*@图[1-9]\s*$/;
 
 interface ComposerAnnotationObject {
   id: string;
@@ -398,6 +399,7 @@ function mergeComposerTextWithAnnotations(
   contexts: ComposerAnnotationContextState[],
 ): string {
   const existing = parseSystemObjectLines(text);
+  const existingObjectIds = new Set(existing.keys());
   if (contexts.length === 0) return stripSystemObjectLines(text).trim();
 
   const contextDefs = contexts
@@ -461,29 +463,31 @@ function mergeComposerTextWithAnnotations(
     }
 
     const pendingInsertedBlocks: Array<{ objectIds: string[]; objectLines: string[]; offset: number }> = [];
-    contextDefs.forEach((def) => {
-      if (!def.slot) return;
-      if (def.objectIds.every((id) => emittedObjectIds.has(id))) return;
-      const slotMatch = buildSlotTokenPattern(def.slot).exec(line);
-      if (!slotMatch) return;
-      const insertedIds: string[] = [];
-      const insertedLines: string[] = [];
-      def.objectIds.forEach((id) => {
-        if (emittedObjectIds.has(id)) return;
-        const objectLine = def.objectLines.get(id);
-        if (!objectLine) return;
-        insertedIds.push(id);
-        insertedLines.push(objectLine);
-        emittedObjectIds.add(id);
-      });
-      if (insertedLines.length > 0) {
-        pendingInsertedBlocks.push({
-          objectIds: insertedIds,
-          objectLines: insertedLines,
-          offset: slotMatch.index + slotMatch[0].length,
+    if (!matched) {
+      contextDefs.forEach((def) => {
+        if (!def.slot) return;
+        const pendingIds = def.objectIds.filter((id) => !emittedObjectIds.has(id) && !existingObjectIds.has(id));
+        if (pendingIds.length === 0) return;
+        const slotMatch = buildSlotTokenPattern(def.slot).exec(line);
+        if (!slotMatch) return;
+        const insertedIds: string[] = [];
+        const insertedLines: string[] = [];
+        pendingIds.forEach((id) => {
+          const objectLine = def.objectLines.get(id);
+          if (!objectLine) return;
+          insertedIds.push(id);
+          insertedLines.push(objectLine);
+          emittedObjectIds.add(id);
         });
-      }
-    });
+        if (insertedLines.length > 0) {
+          pendingInsertedBlocks.push({
+            objectIds: insertedIds,
+            objectLines: insertedLines,
+            offset: slotMatch.index + slotMatch[0].length,
+          });
+        }
+      });
+    }
 
     const expandedEntries: Array<{ value: string; objectId: string | null }> = [];
     if (pendingInsertedBlocks.length === 0) {
@@ -507,7 +511,9 @@ function mergeComposerTextWithAnnotations(
     }
 
     expandedEntries.forEach((entry) => {
-      if (entry.value.trim().length > 0 || rawLine.trim().length === 0) {
+      const trimmedEntry = entry.value.trim();
+      if (ORPHAN_MOVE_SUFFIX_LINE_REGEX.test(trimmedEntry)) return;
+      if (trimmedEntry.length > 0 || rawLine.trim().length === 0) {
         outputLines.push(entry.value);
         if (entry.objectId) {
           outputLineIndexByObjectId.set(entry.objectId, outputLines.length - 1);
