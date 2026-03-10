@@ -349,9 +349,13 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function buildSlotTokenPattern(slot: string, flags = ''): RegExp {
+  return new RegExp(`@${escapeRegExp(slot)}(?!\\d)`, flags);
+}
+
 function ensureSlotTokenExists(text: string, slot: string): string {
   if (!slot) return text;
-  const pattern = new RegExp(`@${escapeRegExp(slot)}(?=\\s|$)`);
+  const pattern = buildSlotTokenPattern(slot);
   if (pattern.test(text)) return text;
   const trimmed = text.trim();
   if (!trimmed) return `@${slot}`;
@@ -452,13 +456,12 @@ function mergeComposerTextWithAnnotations(
       }
     }
 
-    const pendingInsertedBlocks: Array<{ objectIds: string[]; objectLines: string[] }> = [];
+    const pendingInsertedBlocks: Array<{ objectIds: string[]; objectLines: string[]; offset: number }> = [];
     contextDefs.forEach((def) => {
       if (!def.slot) return;
       if (def.objectIds.every((id) => emittedObjectIds.has(id))) return;
-      const slotPattern = new RegExp(`@${escapeRegExp(def.slot)}(?=\\s|$)`);
-      if (!slotPattern.test(line)) return;
-      line = line.replace(slotPattern, '').replace(/[ \t]{2,}/g, ' ').replace(/\s+$/g, '');
+      const slotMatch = buildSlotTokenPattern(def.slot).exec(line);
+      if (!slotMatch) return;
       const insertedIds: string[] = [];
       const insertedLines: string[] = [];
       def.objectIds.forEach((id) => {
@@ -470,25 +473,42 @@ function mergeComposerTextWithAnnotations(
         emittedObjectIds.add(id);
       });
       if (insertedLines.length > 0) {
-        pendingInsertedBlocks.push({ objectIds: insertedIds, objectLines: insertedLines });
+        pendingInsertedBlocks.push({
+          objectIds: insertedIds,
+          objectLines: insertedLines,
+          offset: slotMatch.index + slotMatch[0].length,
+        });
       }
     });
 
-    if (line.trim().length > 0 || rawLine.trim().length === 0) {
-      outputLines.push(line);
-      if (lineObjectId) {
-        outputLineIndexByObjectId.set(lineObjectId, outputLines.length - 1);
-      }
+    const expandedEntries: Array<{ value: string; objectId: string | null }> = [];
+    if (pendingInsertedBlocks.length === 0) {
+      expandedEntries.push({ value: line, objectId: lineObjectId });
+    } else {
+      const sortedBlocks = [...pendingInsertedBlocks].sort((a, b) => a.offset - b.offset);
+      let cursor = 0;
+      sortedBlocks.forEach((entry) => {
+        const before = line.slice(cursor, entry.offset);
+        expandedEntries.push({ value: before, objectId: null });
+        entry.objectLines.forEach((objectLine, idx) => {
+          expandedEntries.push({
+            value: objectLine,
+            objectId: entry.objectIds[idx] || null,
+          });
+        });
+        cursor = entry.offset;
+      });
+      const trailing = line.slice(cursor);
+      expandedEntries.push({ value: trailing, objectId: lineObjectId });
     }
 
-    pendingInsertedBlocks.forEach((entry) => {
-      entry.objectLines.forEach((objectLine, idx) => {
-        outputLines.push(objectLine);
-        const objectId = entry.objectIds[idx];
-        if (objectId) {
-          outputLineIndexByObjectId.set(objectId, outputLines.length - 1);
+    expandedEntries.forEach((entry) => {
+      if (entry.value.trim().length > 0 || rawLine.trim().length === 0) {
+        outputLines.push(entry.value);
+        if (entry.objectId) {
+          outputLineIndexByObjectId.set(entry.objectId, outputLines.length - 1);
         }
-      });
+      }
     });
   });
 
@@ -1044,7 +1064,12 @@ export function StudioPage() {
     setAnnotationContextsByMention(nextContextsByMention);
     const nextContexts = Object.values(nextContextsByMention);
     if (objects.length > 0) {
-      setComposerText((prev) => mergeComposerTextWithAnnotations(prev, nextContexts));
+      setComposerText((prev) =>
+        ensureSlotTokenExists(
+          mergeComposerTextWithAnnotations(prev, nextContexts),
+          referenceSlot,
+        ),
+      );
       return;
     }
     setComposerText((prev) => {
