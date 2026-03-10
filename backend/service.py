@@ -7,13 +7,16 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response
@@ -46,6 +49,8 @@ class ImportSessionRequest(BaseModel):
 class RuntimeHttpConfigRequest(BaseModel):
     endpoint: str = Field(default="")
     api_key: str = Field(default="")
+    text_api_key: str = Field(default="")
+    text_model: str = Field(default="gpt-4.1-mini")
     response_format: str = Field(default="url")
     timeout_seconds: int = Field(default=120)
     download_dir: str = Field(default="")
@@ -53,6 +58,10 @@ class RuntimeHttpConfigRequest(BaseModel):
 
 class RuntimeConfigRequest(BaseModel):
     http: RuntimeHttpConfigRequest = Field(default_factory=RuntimeHttpConfigRequest)
+
+
+class UpdateWorkspaceModeRequest(BaseModel):
+    mode: str = Field(default="image")
 
 
 class UpdateAssetRequest(BaseModel):
@@ -70,6 +79,52 @@ class MentionStaticUploadResult(BaseModel):
     thumbnail_url: str
 
 
+class WorkflowTemplateCreateRequest(BaseModel):
+    name: str = Field(default="未命名模板")
+    description: str = Field(default="")
+    graph: Dict[str, Any] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+
+
+class WorkflowTemplateUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    graph: Optional[Dict[str, Any]] = None
+    tags: Optional[List[str]] = None
+
+
+class WorkflowPromptCardCreateRequest(BaseModel):
+    name: str = Field(default="未命名指令卡片")
+    text: str = Field(default="")
+    tags: List[str] = Field(default_factory=list)
+
+
+class WorkflowPromptCardUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    text: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
+class WorkflowBridgeConfigRequest(BaseModel):
+    base_url: str = Field(default="http://127.0.0.1:9000/api/studio")
+    enabled: bool = Field(default=False)
+
+
+class WorkflowRunPreviewRequest(BaseModel):
+    assets: List[Any] = Field(default_factory=list)
+    prompts: List[Any] = Field(default_factory=list)
+    recipes: List[Dict[str, Any]] = Field(default_factory=list)
+    combination_mode: str = Field(default="broadcast")
+    variants_per_item: int = Field(default=1)
+    concurrency: int = Field(default=2)
+    slot_bindings: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class WorkflowRunCreateRequest(WorkflowRunPreviewRequest):
+    workspace_id: str = Field(default="")
+    name: str = Field(default="工作流批运行")
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = PROJECT_ROOT / "data"
 SESSIONS_DIR = DATA_ROOT / "sessions"
@@ -82,6 +137,11 @@ OFFICIAL_ASSETS_FILE = DATA_ROOT / "official_assets.json"
 OFFICIAL_PROMPTS_FILE = DATA_ROOT / "official_prompts.json"
 RUNTIME_CONFIG_FILE = DATA_ROOT / "runtime_config.json"
 MENTION_SETTINGS_FILE = DATA_ROOT / "mention_settings.json"
+WORKFLOW_TEMPLATES_FILE = DATA_ROOT / "workflow_templates.json"
+WORKFLOW_PROMPT_CARDS_FILE = DATA_ROOT / "workflow_prompt_cards.json"
+WORKFLOW_BRIDGE_CONFIG_FILE = DATA_ROOT / "workflow_bridge_config.json"
+WORKFLOW_RUNS_DIR = DATA_ROOT / "workflow_runs"
+WORKFLOW_RUNS_INDEX_FILE = DATA_ROOT / "workflow_runs_index.json"
 
 IMAGE_EXT_ALLOWLIST = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
@@ -92,17 +152,29 @@ ASPECT_RATIO_OPTIONS = ["4:3", "3:4", "16:9", "9:16", "2:3", "3:2", "1:1", "4:5"
 QUALITY_OPTIONS = ["1K", "2K", "4K"]
 COUNT_OPTIONS = [1, 2, 3, 4]
 PROTECTED_MENTION_SOURCE_IDS = {"upload", "generated", "saved"}
-# 每张图仅请求一次，避免“选择1张却触发多次计费请求”
-HTTP_GENERATE_MAX_ATTEMPTS = 1
+# 为降低并发下的瞬时网络失败，允许有限次重试；仅瞬时网络错误会进入重试分支。
+HTTP_GENERATE_MAX_ATTEMPTS = 3
+TEXT_STREAM_TRANSIENT_MAX_RETRIES = 2
+TEXT_PROMPT_PACK_MODE = "five_image_prompts"
+WORKFLOW_RUN_MAX_TASKS = 50
+WORKFLOW_PRIMARY_ASSET_MENTIONS = {"input_asset", "主素材"}
+WORKFLOW_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_\u4e00-\u9fff]+)")
 
 DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
     "http": {
         "endpoint": "",
         "api_key": "",
+        "text_api_key": "",
+        "text_model": "gpt-4.1-mini",
         "response_format": "url",
         "timeout_seconds": 120,
         "download_dir": "",
     },
+}
+
+DEFAULT_WORKFLOW_BRIDGE_CONFIG: Dict[str, Any] = {
+    "base_url": "http://127.0.0.1:9000/api/studio",
+    "enabled": False,
 }
 
 
@@ -114,8 +186,27 @@ def _runtime_http_api_key_from_env() -> str:
     return ""
 
 
+def _runtime_text_api_key_from_env() -> str:
+    for name in ("STUDIO_TEXT_API_KEY", "OPENAI_API_KEY"):
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return None
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -130,10 +221,19 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+    # Use per-write unique temp files to avoid collisions under concurrent writes.
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _ratio_to_size(ratio: str) -> Tuple[int, int]:
@@ -182,11 +282,20 @@ def _normalize_count(count: int) -> int:
     return val
 
 
+def _normalize_composer_mode(mode: Any) -> str:
+    value = str(mode or "").strip().lower()
+    if value == "text":
+        return "text"
+    return "image"
+
+
 def _normalize_runtime_config(payload: Any) -> Dict[str, Any]:
     cfg = {
         "http": {
             "endpoint": "",
             "api_key": "",
+            "text_api_key": "",
+            "text_model": "gpt-4.1-mini",
             "response_format": "url",
             "timeout_seconds": 120,
             "download_dir": "",
@@ -199,6 +308,8 @@ def _normalize_runtime_config(payload: Any) -> Dict[str, Any]:
     if isinstance(http_payload, dict):
         cfg["http"]["endpoint"] = str(http_payload.get("endpoint") or "").strip()
         cfg["http"]["api_key"] = str(http_payload.get("api_key") or "")
+        cfg["http"]["text_api_key"] = str(http_payload.get("text_api_key") or "")
+        cfg["http"]["text_model"] = str(http_payload.get("text_model") or "gpt-4.1-mini").strip() or "gpt-4.1-mini"
         response_format = str(http_payload.get("response_format") or "url").strip().lower()
         cfg["http"]["response_format"] = "b64_json" if response_format == "b64_json" else "url"
 
@@ -218,21 +329,41 @@ def _default_mention_settings(prompts: List[Dict[str, Any]], taxonomies: Dict[st
         "search_placeholder": "搜索素材标题...",
         "upload_button_text": "点击 / 拖拽 / 粘贴 上传",
         "sources": [
-            {"id": "upload", "name": "上传", "enabled": True, "order": 1, "kind": "dynamic", "items": []},
-            {"id": "generated", "name": "生成", "enabled": True, "order": 2, "kind": "dynamic", "items": []},
-            {"id": "saved", "name": "素材库", "enabled": True, "order": 3, "kind": "dynamic", "items": []},
-            {"id": "official", "name": "官方", "enabled": True, "order": 4, "kind": "dynamic", "items": []},
+            {"id": "upload", "name": "上传", "enabled": True, "order": 1, "kind": "dynamic", "content_type": "image", "items": []},
+            {"id": "generated", "name": "生成", "enabled": True, "order": 2, "kind": "dynamic", "content_type": "image", "items": []},
+            {"id": "saved", "name": "素材库", "enabled": True, "order": 3, "kind": "dynamic", "content_type": "image", "items": []},
+            {"id": "official", "name": "官方", "enabled": True, "order": 4, "kind": "dynamic", "content_type": "image", "items": []},
         ],
         "official_prompts": prompts,
         "official_taxonomies": taxonomies,
     }
 
 
-def _normalize_source_item(item: Any, index: int) -> Dict[str, Any]:
+def _normalize_source_content_type(value: Any) -> str:
+    return "text" if str(value or "").strip().lower() == "text" else "image"
+
+
+def _normalize_prompt_pack_mode(value: Any) -> str:
+    return TEXT_PROMPT_PACK_MODE if str(value or "").strip().lower() == TEXT_PROMPT_PACK_MODE else ""
+
+
+def _five_prompt_json_instruction() -> str:
+    return (
+        "请基于用户输入生成 5 条可直接用于室内设计生图的中文提示词方案。"
+        "你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。"
+        "JSON 结构固定为："
+        '{"options":[{"title":"方案名","prompt":"可直接生图的完整提示词"}],"follow_up":"一句中文引导用户选择的问题"}。'
+        "其中 options 必须严格为 5 项；每个 prompt 要具体、可执行、风格清晰。"
+    )
+
+
+def _normalize_source_item(item: Any, index: int, source_content_type: str = "image") -> Dict[str, Any]:
     if not isinstance(item, dict):
         item = {}
     sid = str(item.get("id") or f"static-{uuid.uuid4().hex[:10]}")
-    title = str(item.get("title") or "未命名素材").strip() or "未命名素材"
+    item_type = _normalize_source_content_type(item.get("item_type") or source_content_type)
+    title_default = "未命名文本" if item_type == "text" else "未命名素材"
+    title = str(item.get("title") or title_default).strip() or title_default
     tags_raw = item.get("tags")
     tags: List[str] = []
     if isinstance(tags_raw, list):
@@ -244,12 +375,15 @@ def _normalize_source_item(item: Any, index: int) -> Dict[str, Any]:
         order = int(item.get("order") or (index + 1))
     except Exception:
         order = index + 1
-    storage_key = str(item.get("storage_key") or "").strip()
+    content = str(item.get("content") or "").strip() if item_type == "text" else ""
+    storage_key = str(item.get("storage_key") or "").strip() if item_type == "image" else ""
     return {
         "id": sid,
         "title": title,
         "order": max(1, order),
         "tags": tags,
+        "item_type": item_type,
+        "content": content,
         "storage_key": storage_key,
     }
 
@@ -280,10 +414,13 @@ def _normalize_mention_settings(payload: Any, default_payload: Dict[str, Any]) -
         except Exception:
             order = idx + 1
         enabled = bool(source.get("enabled", True))
+        source_content_type = "image"
+        if source_kind == "static":
+            source_content_type = _normalize_source_content_type(source.get("content_type") or "image")
         items_raw = source.get("items")
         items: List[Dict[str, Any]] = []
         if source_kind == "static" and isinstance(items_raw, list):
-            items = [_normalize_source_item(item, i) for i, item in enumerate(items_raw)]
+            items = [_normalize_source_item(item, i, source_content_type) for i, item in enumerate(items_raw)]
             items.sort(key=lambda x: int(x.get("order") or 0))
         sources.append(
             {
@@ -292,6 +429,7 @@ def _normalize_mention_settings(payload: Any, default_payload: Dict[str, Any]) -
                 "enabled": enabled,
                 "order": max(1, order),
                 "kind": source_kind,
+                "content_type": source_content_type,
                 "items": items,
             }
         )
@@ -368,9 +506,61 @@ def _public_deleted_asset_stub(ref: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _merge_session_messages(existing_messages: Any, incoming_messages: Any) -> List[Dict[str, Any]]:
+    existing = existing_messages if isinstance(existing_messages, list) else []
+    incoming = incoming_messages if isinstance(incoming_messages, list) else []
+    merged: List[Dict[str, Any]] = []
+    pos_by_id: Dict[str, int] = {}
+
+    def _append_or_replace(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            merged.append(item)
+            return
+        prev_index = pos_by_id.get(mid)
+        if prev_index is None:
+            pos_by_id[mid] = len(merged)
+            merged.append(item)
+            return
+        merged[prev_index] = item
+
+    for msg in existing:
+        _append_or_replace(msg)
+    for msg in incoming:
+        _append_or_replace(msg)
+
+    return merged
+
+
 class StudioService:
     def __init__(self):
+        self._session_locks_guard = threading.Lock()
+        self._session_locks: Dict[str, threading.Lock] = {}
+        self._workflow_run_locks_guard = threading.Lock()
+        self._workflow_run_locks: Dict[str, threading.Lock] = {}
+        self._workflow_runner_guard = threading.Lock()
+        self._workflow_runner_threads: Dict[str, threading.Thread] = {}
         self.ensure_runtime()
+
+    def _get_session_lock(self, sid: str) -> threading.Lock:
+        key = str(sid or "").strip()
+        with self._session_locks_guard:
+            lock = self._session_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[key] = lock
+            return lock
+
+    def _get_workflow_run_lock(self, run_id: str) -> threading.Lock:
+        key = str(run_id or "").strip()
+        with self._workflow_run_locks_guard:
+            lock = self._workflow_run_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._workflow_run_locks[key] = lock
+            return lock
 
     def ensure_runtime(self) -> None:
         DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -378,6 +568,7 @@ class StudioService:
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         MENTION_SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+        WORKFLOW_RUNS_DIR.mkdir(parents=True, exist_ok=True)
         if not SESSIONS_INDEX_FILE.exists():
             _write_json(SESSIONS_INDEX_FILE, [])
         if not ASSET_INDEX_FILE.exists():
@@ -396,6 +587,14 @@ class StudioService:
                     self.list_official_taxonomies(),
                 ),
             )
+        if not WORKFLOW_TEMPLATES_FILE.exists():
+            _write_json(WORKFLOW_TEMPLATES_FILE, [])
+        if not WORKFLOW_PROMPT_CARDS_FILE.exists():
+            _write_json(WORKFLOW_PROMPT_CARDS_FILE, [])
+        if not WORKFLOW_BRIDGE_CONFIG_FILE.exists():
+            _write_json(WORKFLOW_BRIDGE_CONFIG_FILE, DEFAULT_WORKFLOW_BRIDGE_CONFIG)
+        if not WORKFLOW_RUNS_INDEX_FILE.exists():
+            _write_json(WORKFLOW_RUNS_INDEX_FILE, [])
 
     def _seed_official_assets(self) -> None:
         scenes = ["客厅", "卧室", "餐厅", "厨房", "书房", "卫生间", "玄关", "阳台"]
@@ -467,27 +666,75 @@ class StudioService:
 
     def _save_session_raw(self, session: Dict[str, Any]) -> None:
         sid = session["id"]
-        _write_json(self._session_file(sid), session)
-        index = self._load_sessions_index()
-        found = False
-        for item in index:
-            if item.get("id") == sid:
-                item["name"] = session.get("name", "")
-                item["updated_at"] = session.get("updated_at", _now_iso())
-                item["created_at"] = session.get("created_at", item.get("created_at", _now_iso()))
-                found = True
-                break
-        if not found:
-            index.append(
-                {
-                    "id": sid,
-                    "name": session.get("name", "未命名会话"),
-                    "created_at": session.get("created_at", _now_iso()),
-                    "updated_at": session.get("updated_at", _now_iso()),
-                }
-            )
-        index.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-        self._save_sessions_index(index)
+        lock = self._get_session_lock(sid)
+        with lock:
+            current = self._load_session_raw(sid) or {}
+            merged_session = dict(current)
+            merged_session.update(session)
+            merged_session["composer_mode"] = _normalize_composer_mode(merged_session.get("composer_mode"))
+            merged_session["messages"] = _merge_session_messages(current.get("messages"), session.get("messages"))
+
+            _write_json(self._session_file(sid), merged_session)
+
+            index = self._load_sessions_index()
+            found = False
+            for item in index:
+                if item.get("id") == sid:
+                    item["name"] = merged_session.get("name", "")
+                    item["updated_at"] = merged_session.get("updated_at", _now_iso())
+                    item["created_at"] = merged_session.get("created_at", item.get("created_at", _now_iso()))
+                    item["composer_mode"] = merged_session.get("composer_mode", "image")
+                    found = True
+                    break
+            if not found:
+                index.append(
+                    {
+                        "id": sid,
+                        "name": merged_session.get("name", "未命名会话"),
+                        "created_at": merged_session.get("created_at", _now_iso()),
+                        "updated_at": merged_session.get("updated_at", _now_iso()),
+                        "composer_mode": merged_session.get("composer_mode", "image"),
+                    }
+                )
+            index.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+            self._save_sessions_index(index)
+
+    def _running_message_stale_seconds(self) -> int:
+        config = self.get_runtime_config()
+        http_cfg = config.get("http") if isinstance(config.get("http"), dict) else {}
+        try:
+            timeout_seconds = int(http_cfg.get("timeout_seconds") or 120)
+        except Exception:
+            timeout_seconds = 120
+        timeout_seconds = max(5, min(timeout_seconds, 600))
+        return max(180, min(timeout_seconds * 2, 1800))
+
+    def _repair_stale_running_messages(self, session: Dict[str, Any]) -> bool:
+        messages = session.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
+        now = datetime.now()
+        stale_after = self._running_message_stale_seconds()
+        changed = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role") or "").strip() != "assistant":
+                continue
+            if str(msg.get("status") or "").strip() != "running":
+                continue
+            created_at = _parse_iso_datetime(msg.get("created_at"))
+            if not created_at:
+                continue
+            if (now - created_at).total_seconds() < stale_after:
+                continue
+            mode = _normalize_composer_mode(msg.get("mode"))
+            msg["status"] = "failed"
+            msg["text"] = "文本任务已超时或中断，请重试。" if mode == "text" else "生成任务已超时或中断，请重试。"
+            changed = True
+        if changed:
+            session["updated_at"] = _now_iso()
+        return changed
 
     def _resolve_asset(self, asset_id: str) -> Optional[Dict[str, Any]]:
         if not asset_id:
@@ -514,6 +761,9 @@ class StudioService:
                     continue
                 if str(item.get("id") or "") != item_id:
                     continue
+                item_type = _normalize_source_content_type(item.get("item_type") or source.get("content_type") or "image")
+                if item_type != "image":
+                    return None
                 storage_key = str(item.get("storage_key") or "").strip()
                 if not storage_key:
                     return None
@@ -533,6 +783,7 @@ class StudioService:
 
     def _hydrate_message_assets(self, msg: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(msg)
+        out["mode"] = _normalize_composer_mode(out.get("mode"))
         attachment_ids = out.get("attachment_asset_ids") or []
         image_ids = out.get("image_asset_ids") or []
         attachment_list: List[Dict[str, Any]] = []
@@ -594,16 +845,22 @@ class StudioService:
         normalized = _normalize_runtime_config(loaded)
         if loaded != normalized:
             _write_json(RUNTIME_CONFIG_FILE, normalized)
-        env_managed = bool(_runtime_http_api_key_from_env())
-        if env_managed:
+        image_env_managed = bool(_runtime_http_api_key_from_env())
+        text_env_managed = bool(_runtime_text_api_key_from_env())
+        if image_env_managed:
             normalized["http"]["api_key"] = ""
-        normalized["http"]["api_key_managed_by_env"] = env_managed
+        if text_env_managed:
+            normalized["http"]["text_api_key"] = ""
+        normalized["http"]["api_key_managed_by_env"] = image_env_managed
+        normalized["http"]["text_api_key_managed_by_env"] = text_env_managed
         return normalized
 
     def update_runtime_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized = _normalize_runtime_config(payload)
         if _runtime_http_api_key_from_env():
             normalized["http"]["api_key"] = ""
+        if _runtime_text_api_key_from_env():
+            normalized["http"]["text_api_key"] = ""
         _write_json(RUNTIME_CONFIG_FILE, normalized)
         return normalized
 
@@ -635,17 +892,25 @@ class StudioService:
         for source in settings.get("sources") or []:
             if not isinstance(source, dict):
                 continue
+            source_kind = str(source.get("kind") or "dynamic").strip().lower()
+            source_content_type = _normalize_source_content_type(source.get("content_type") or "image")
             item_list: List[Dict[str, Any]] = []
             for item in source.get("items") or []:
                 if not isinstance(item, dict):
                     continue
                 item_out = dict(item)
                 item_id = str(item.get("id") or "").strip()
-                if item_id:
+                item_type = _normalize_source_content_type(item.get("item_type") or source_content_type)
+                item_out["item_type"] = item_type
+                if item_type == "text":
+                    item_out["storage_key"] = ""
+                if item_id and item_type == "image":
                     item_out["file_url"] = f"/api/v1/mention-settings/items/{item_id}/file"
                     item_out["thumbnail_url"] = f"/api/v1/mention-settings/items/{item_id}/file?thumb=1"
                 item_list.append(item_out)
             source_out = dict(source)
+            source_out["kind"] = "static" if source_kind == "static" else "dynamic"
+            source_out["content_type"] = source_content_type
             source_out["items"] = item_list
             sources.append(source_out)
         out["sources"] = sources
@@ -733,6 +998,22 @@ class StudioService:
         if not content:
             raise HTTPException(status_code=400, detail="上传内容为空")
         sid = str(source_id or "custom").strip() or "custom"
+        settings = self.get_mention_settings()
+        source = None
+        for item in settings.get("sources") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "").strip() != sid:
+                continue
+            source = item
+            break
+        if not source:
+            raise HTTPException(status_code=404, detail="来源不存在")
+        if str(source.get("kind") or "").strip().lower() != "static":
+            raise HTTPException(status_code=400, detail="仅静态来源支持上传素材")
+        if _normalize_source_content_type(source.get("content_type") or "image") != "image":
+            raise HTTPException(status_code=400, detail="文字类型来源不支持上传图片素材")
+
         safe_sid = "".join(ch for ch in sid if ch.isalnum() or ch in {"-", "_"}).strip() or "custom"
         source_dir = MENTION_SOURCE_DIR / safe_sid
         source_dir.mkdir(parents=True, exist_ok=True)
@@ -766,6 +1047,9 @@ class StudioService:
                 if not isinstance(item, dict):
                     continue
                 if str(item.get("id") or "") == item_id:
+                    item_type = _normalize_source_content_type(item.get("item_type") or source.get("content_type") or "image")
+                    if item_type != "image":
+                        return None
                     storage_key = str(item.get("storage_key") or "").strip()
                     return storage_key or None
         return None
@@ -797,6 +1081,7 @@ class StudioService:
         session = {
             "id": sid,
             "name": (name or "室内设计会话").strip() or "室内设计会话",
+            "composer_mode": "image",
             "created_at": now,
             "updated_at": now,
             "messages": [],
@@ -807,6 +1092,7 @@ class StudioService:
     def import_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         created = self.create_session(name=payload.get("name"))
         raw = self._load_session_raw(created["id"]) or created
+        raw["composer_mode"] = _normalize_composer_mode(payload.get("composer_mode"))
         messages = payload.get("messages") or []
         normalized: List[Dict[str, Any]] = []
         for msg in messages:
@@ -823,6 +1109,7 @@ class StudioService:
                     "params": msg.get("params") if isinstance(msg.get("params"), dict) else {},
                     "attachment_asset_ids": [],
                     "image_asset_ids": [],
+                    "mode": _normalize_composer_mode(msg.get("mode")),
                     "status": "completed",
                     "created_at": _now_iso(),
                 }
@@ -836,7 +1123,17 @@ class StudioService:
         raw = self._load_session_raw(sid)
         if not raw:
             return None
+        changed = False
+        normalized_mode = _normalize_composer_mode(raw.get("composer_mode"))
+        if raw.get("composer_mode") != normalized_mode:
+            raw["composer_mode"] = normalized_mode
+            changed = True
+        if self._repair_stale_running_messages(raw):
+            changed = True
+        if changed:
+            self._save_session_raw(raw)
         hydrated = dict(raw)
+        hydrated["composer_mode"] = normalized_mode
         hydrated["messages"] = [self._hydrate_message_assets(m) for m in (raw.get("messages") or [])]
         return hydrated
 
@@ -855,6 +1152,15 @@ class StudioService:
             shutil.rmtree(gen_dir, ignore_errors=True)
         index = [x for x in self._load_sessions_index() if x.get("id") != sid]
         self._save_sessions_index(index)
+
+    def update_session_mode(self, sid: str, mode: str) -> Dict[str, Any]:
+        raw = self._load_session_raw(sid)
+        if not raw:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raw["composer_mode"] = _normalize_composer_mode(mode)
+        raw["updated_at"] = _now_iso()
+        self._save_session_raw(raw)
+        return self.get_session_or_404(sid)
 
     def _create_asset_record(
         self,
@@ -1276,6 +1582,27 @@ class StudioService:
             return f"{value}/images/generations"
         return value
 
+    def _normalize_chat_endpoint(self, endpoint: str) -> str:
+        value = str(endpoint or "").strip()
+        if not value:
+            return ""
+        value = value.rstrip("/")
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.netloc:
+            if value.endswith("/images/generations"):
+                return f"{value[: -len('/images/generations')]}/chat/completions"
+            if value.endswith("/v1"):
+                return f"{value}/chat/completions"
+            return value
+        path = parsed.path or ""
+        if path in {"", "/"}:
+            return f"{value}/v1/chat/completions"
+        if path == "/v1":
+            return f"{value}/chat/completions"
+        if path.endswith("/images/generations"):
+            return f"{value[: -len('/images/generations')]}/chat/completions"
+        return value
+
     def _resolve_xiaodoubao_model(self, image_size: str, selected_model: str) -> str:
         model = str(selected_model or "").strip().lower()
         if model in {
@@ -1293,11 +1620,12 @@ class StudioService:
         }
         return mapping.get(image_size, "nano-banana-2-2k")
 
-    def _asset_to_b64(self, asset_id: str) -> Optional[str]:
+    def _asset_to_binary(self, asset_id: str) -> Optional[Tuple[bytes, str]]:
         asset = self._resolve_asset(asset_id)
         if not asset:
             return None
         content: Optional[bytes] = None
+        mime_type = "image/png"
         if asset.get("kind") == "official":
             content = self.render_official_preview(asset_id, thumb=False)
         else:
@@ -1307,11 +1635,94 @@ class StudioService:
                 if path.exists():
                     try:
                         content = path.read_bytes()
+                        ext = path.suffix.lower()
+                        mime_mapping = {
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".webp": "image/webp",
+                            ".bmp": "image/bmp",
+                            ".gif": "image/gif",
+                        }
+                        mime_type = mime_mapping.get(ext, "image/png")
                     except Exception:
                         content = None
         if not content:
             return None
+        return content, mime_type
+
+    def _asset_to_b64(self, asset_id: str) -> Optional[str]:
+        binary = self._asset_to_binary(asset_id)
+        if not binary:
+            return None
+        content, _mime_type = binary
         return base64.b64encode(content).decode("utf-8")
+
+    def _optimize_multimodal_image(self, content: bytes) -> Tuple[bytes, str]:
+        # 避免把超大原图直接塞进 data URL，导致网关超时/断连
+        max_edge = 1600
+        target_bytes = 2_000_000
+        min_edge = 640
+        try:
+            with Image.open(io.BytesIO(content)) as img:
+                frame = img.copy()
+        except Exception:
+            return content, "image/png"
+
+        if max(frame.size or (0, 0)) <= 0:
+            return content, "image/png"
+
+        # 先按最大边缩放到视觉模型常见输入尺寸
+        width, height = frame.size
+        largest_edge = max(width, height)
+        if largest_edge > max_edge:
+            ratio = max_edge / float(largest_edge)
+            frame = frame.resize((max(1, int(width * ratio)), max(1, int(height * ratio))), Image.LANCZOS)
+
+        if frame.mode not in ("RGB", "L"):
+            frame = frame.convert("RGB")
+        elif frame.mode == "L":
+            frame = frame.convert("RGB")
+
+        quality_levels = [85, 78, 72, 66, 60]
+        best_payload: Optional[bytes] = None
+        best_size = 1 << 62
+
+        working = frame
+        for _round in range(5):
+            for quality in quality_levels:
+                buf = io.BytesIO()
+                try:
+                    working.save(buf, format="JPEG", quality=quality, optimize=True)
+                except Exception:
+                    continue
+                payload = buf.getvalue()
+                size = len(payload)
+                if size < best_size:
+                    best_payload = payload
+                    best_size = size
+                if size <= target_bytes:
+                    return payload, "image/jpeg"
+
+            w, h = working.size
+            if min(w, h) <= min_edge:
+                break
+            shrink = 0.85
+            working = working.resize((max(min_edge, int(w * shrink)), max(min_edge, int(h * shrink))), Image.LANCZOS)
+
+        if best_payload:
+            return best_payload, "image/jpeg"
+        return content, "image/png"
+
+    def _asset_to_data_url(self, asset_id: str) -> Optional[str]:
+        binary = self._asset_to_binary(asset_id)
+        if not binary:
+            return None
+        content, mime_type = binary
+        if len(content) > 1_500_000:
+            content, mime_type = self._optimize_multimodal_image(content)
+        b64 = base64.b64encode(content).decode("utf-8")
+        return f"data:{mime_type};base64,{b64}"
 
     def _build_reference_images(self, attachment_ids: List[str]) -> List[str]:
         images: List[str] = []
@@ -1381,6 +1792,163 @@ class StudioService:
             raise ValueError("接口返回里没有可识别图片（data/images）")
 
         return self._decode_candidate_to_binary(candidates[0], timeout_seconds)
+
+    def _resolve_text_runtime(self) -> Dict[str, Any]:
+        config = self.get_runtime_config()
+        http_cfg = config.get("http") if isinstance(config.get("http"), dict) else {}
+        chat_endpoint = self._normalize_chat_endpoint(str(http_cfg.get("endpoint") or ""))
+        if not chat_endpoint:
+            raise HTTPException(status_code=400, detail="请先在设置中填写 API 地址。")
+        timeout_seconds = max(5, min(int(http_cfg.get("timeout_seconds") or 120), 600))
+        text_model = str(http_cfg.get("text_model") or "").strip() or "gpt-4.1-mini"
+        api_key = (
+            _runtime_text_api_key_from_env()
+            or str(http_cfg.get("text_api_key") or "").strip()
+            or _runtime_http_api_key_from_env()
+            or str(http_cfg.get("api_key") or "").strip()
+        )
+        return {
+            "endpoint": chat_endpoint,
+            "timeout_seconds": timeout_seconds,
+            "api_key": api_key,
+            "model": text_model,
+        }
+
+    def _content_node_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text = ""
+                if "text" in item:
+                    text = str(item.get("text") or "")
+                elif "output_text" in item:
+                    text = str(item.get("output_text") or "")
+                elif item.get("type") in {"text", "output_text"}:
+                    text = str(item.get("content") or "")
+                if text:
+                    parts.append(text)
+            return "".join(parts)
+        return ""
+
+    def _extract_chat_delta_text(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) == 0:
+            return ""
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            return ""
+        return self._content_node_to_text(delta.get("content"))
+
+    def _extract_chat_message_text(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) == 0:
+            return ""
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message")
+        if isinstance(message, dict):
+            text = self._content_node_to_text(message.get("content"))
+            if text:
+                return text
+        return self._extract_chat_delta_text(payload)
+
+    def _stream_openai_chat(self, *, endpoint: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_seconds: int) -> Iterator[str]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
+        try:
+            with urllib_request.urlopen(req, timeout=timeout_seconds) as resp:
+                started_at = time.monotonic()
+                content_type = str(resp.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" in content_type:
+                    for raw_line in resp:
+                        if (time.monotonic() - started_at) > timeout_seconds:
+                            raise HTTPException(status_code=502, detail=f"文本模型请求超时（>{timeout_seconds}s）")
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data:
+                            continue
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except Exception:
+                            continue
+                        if isinstance(event, dict) and event.get("error") is not None:
+                            error_payload = event.get("error")
+                            if isinstance(error_payload, dict):
+                                message = str(error_payload.get("message") or "").strip() or json.dumps(error_payload, ensure_ascii=False)
+                            else:
+                                message = str(error_payload).strip()
+                            raise HTTPException(status_code=502, detail=f"文本模型请求失败：{message or '上游返回错误'}")
+                        delta = self._extract_chat_delta_text(event)
+                        if delta:
+                            yield delta
+                    return
+
+                raw_text = resp.read().decode("utf-8")
+                parsed = json.loads(raw_text or "{}")
+                full_text = self._extract_chat_message_text(parsed)
+                if full_text:
+                    yield full_text
+        except urllib_error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8")
+            except Exception:
+                detail = str(exc.reason or "")
+            detail = detail.strip()[:220]
+            raise HTTPException(status_code=502, detail=f"文本模型请求失败：HTTP {exc.code} {detail}".strip()) from exc
+        except urllib_error.URLError as exc:
+            raise HTTPException(status_code=502, detail=f"文本模型网络错误：{exc.reason}") from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"文本模型请求异常：{exc}") from exc
+
+    def _is_transient_upstream_error(self, detail: str) -> bool:
+        raw = str(detail or "").strip().lower()
+        if not raw:
+            return False
+        markers = [
+            "eof occurred in violation of protocol",
+            "unexpected eof while reading",
+            "remote end closed connection without response",
+            "connection reset",
+            "connection reset by peer",
+            "broken pipe",
+            "remote end closed connection",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "connection aborted",
+            "connection closed",
+            "connection refused",
+            "_ssl.c:",
+            "ssl: unexpected eof",
+            "tlsv1 alert internal error",
+            "failed to fetch",
+        ]
+        if any(token in raw for token in markers):
+            return True
+        # 上游 5xx 视作可重试的瞬时故障；4xx 属于业务/参数错误，不重试。
+        if "http 5" in raw:
+            return True
+        return False
+
+    def _is_transient_text_upstream_error(self, detail: str) -> bool:
+        return self._is_transient_upstream_error(detail)
 
     def _normalize_annotation_context(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
@@ -1576,7 +2144,8 @@ class StudioService:
 
         def worker(index: int) -> Tuple[int, bytes, str, str]:
             last_error = "未知错误"
-            for _attempt in range(max(1, HTTP_GENERATE_MAX_ATTEMPTS)):
+            max_attempts = max(1, HTTP_GENERATE_MAX_ATTEMPTS)
+            for attempt_index in range(max_attempts):
                 try:
                     image_bytes, suffix, title = self._request_generation_once(
                         endpoint=endpoint,
@@ -1587,6 +2156,13 @@ class StudioService:
                     return index, image_bytes, suffix, title
                 except Exception as exc:
                     last_error = str(exc)
+                    is_last = attempt_index >= (max_attempts - 1)
+                    if is_last:
+                        break
+                    if not self._is_transient_upstream_error(last_error):
+                        break
+                    backoff = min(1.2, 0.25 * (2 ** attempt_index)) + random.uniform(0.0, 0.08)
+                    time.sleep(backoff)
             raise ValueError(last_error)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(count, 1), 4)) as executor:
@@ -1716,6 +2292,7 @@ class StudioService:
         user_msg = {
             "id": f"msg-{uuid.uuid4().hex[:10]}",
             "role": "user",
+            "mode": "image",
             "text": (text or "").strip(),
             "params": normalized_params,
             "attachment_asset_ids": valid_attachment_ids,
@@ -1729,6 +2306,7 @@ class StudioService:
         assistant_msg = {
             "id": f"msg-{uuid.uuid4().hex[:10]}",
             "role": "assistant",
+            "mode": "image",
             "text": "正在生成中...",
             "params": normalized_params,
             "attachment_asset_ids": [],
@@ -1775,6 +2353,264 @@ class StudioService:
             "user_message": self._hydrate_message_assets(user_msg),
             "assistant_message": self._hydrate_message_assets(assistant_msg),
         }
+
+    def stream_text_turn(
+        self,
+        session_id: str,
+        text: str,
+        params: Dict[str, Any],
+        attachment_asset_ids: List[str],
+        references: Optional[List[Dict[str, Any]]] = None,
+        annotation_context: Optional[Dict[str, Any]] = None,
+        annotation_contexts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Iterator[str]:
+        session = self._load_session_raw(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+        runtime = self._resolve_text_runtime()
+        prompt_pack_mode = _normalize_prompt_pack_mode((params or {}).get("prompt_pack_mode"))
+        valid_references: List[Dict[str, Any]] = []
+        seen_slots: set = set()
+        for idx, ref in enumerate(references or []):
+            if not isinstance(ref, dict):
+                continue
+            slot = str(ref.get("slot") or "").strip()
+            aid = str(ref.get("asset_id") or "").strip()
+            if not slot or not aid or slot in seen_slots:
+                continue
+            if self._resolve_asset(aid) is None:
+                continue
+            try:
+                order = int(ref.get("order") or (idx + 1))
+            except Exception:
+                order = idx + 1
+            seen_slots.add(slot)
+            valid_references.append(
+                {
+                    "mention_id": str(ref.get("mention_id") or f"mention-{uuid.uuid4().hex[:8]}"),
+                    "slot": slot,
+                    "asset_id": aid,
+                    "source": str(ref.get("source") or ""),
+                    "order": order,
+                    "asset_title": str(ref.get("asset_title") or ""),
+                }
+            )
+        valid_references.sort(key=lambda x: int(x.get("order") or 0))
+        valid_attachment_ids: List[str] = []
+        for aid in [x["asset_id"] for x in valid_references] + list(attachment_asset_ids or []):
+            if aid in valid_attachment_ids:
+                continue
+            if self._resolve_asset(aid) is None:
+                continue
+            valid_attachment_ids.append(aid)
+
+        raw_annotation_contexts: List[Dict[str, Any]] = []
+        if isinstance(annotation_contexts, list):
+            raw_annotation_contexts.extend([item for item in annotation_contexts if isinstance(item, dict)])
+        if isinstance(annotation_context, dict) and annotation_context:
+            raw_annotation_contexts.append(annotation_context)
+        normalized_annotation_contexts = self._normalize_annotation_contexts(raw_annotation_contexts)
+        for context in normalized_annotation_contexts:
+            annotation_asset_id = str(context.get("asset_id") or "").strip()
+            if annotation_asset_id and annotation_asset_id not in valid_attachment_ids and self._resolve_asset(annotation_asset_id):
+                valid_attachment_ids.append(annotation_asset_id)
+
+        raw_text = (text or "").strip()
+        composed_text = raw_text
+        annotation_prompt = self._annotation_contexts_to_prompt(normalized_annotation_contexts)
+        if annotation_prompt:
+            if composed_text:
+                composed_text = f"{annotation_prompt}\n\n原始需求:\n{composed_text}"
+            else:
+                composed_text = annotation_prompt
+        if prompt_pack_mode == TEXT_PROMPT_PACK_MODE:
+            structure_instruction = _five_prompt_json_instruction()
+            if composed_text:
+                composed_text = f"{composed_text}\n\n[输出格式要求]\n{structure_instruction}"
+            else:
+                composed_text = structure_instruction
+
+        if not composed_text and len(valid_attachment_ids) == 0:
+            raise HTTPException(status_code=400, detail="请输入内容或添加素材")
+
+        normalized_params = {
+            "model": runtime["model"],
+        }
+        if prompt_pack_mode:
+            normalized_params["prompt_pack_mode"] = prompt_pack_mode
+        user_msg = {
+            "id": f"msg-{uuid.uuid4().hex[:10]}",
+            "role": "user",
+            "mode": "text",
+            "text": raw_text,
+            "params": normalized_params,
+            "attachment_asset_ids": valid_attachment_ids,
+            "image_asset_ids": [],
+            "references": valid_references,
+            "annotation_context": normalized_annotation_contexts[0] if normalized_annotation_contexts else {},
+            "annotation_contexts": normalized_annotation_contexts,
+            "status": "completed",
+            "created_at": _now_iso(),
+        }
+        assistant_msg = {
+            "id": f"msg-{uuid.uuid4().hex[:10]}",
+            "role": "assistant",
+            "mode": "text",
+            "text": "正在思考中...",
+            "params": normalized_params,
+            "attachment_asset_ids": [],
+            "image_asset_ids": [],
+            "status": "running",
+            "created_at": _now_iso(),
+        }
+
+        messages = session.get("messages") or []
+        messages.extend([user_msg, assistant_msg])
+        session["messages"] = messages
+        session["updated_at"] = _now_iso()
+        self._save_session_raw(session)
+
+        def _event_line(payload: Dict[str, Any]) -> str:
+            return f"{json.dumps(payload, ensure_ascii=False)}\n"
+
+        def _generator() -> Iterator[str]:
+            accumulated = ""
+            try:
+                yield _event_line(
+                    {
+                        "type": "start",
+                        "user_message": self._hydrate_message_assets(user_msg),
+                        "assistant_message": self._hydrate_message_assets(assistant_msg),
+                    }
+                )
+                multimodal_data_urls: List[str] = []
+                for aid in valid_attachment_ids:
+                    data_url = self._asset_to_data_url(aid)
+                    if not data_url:
+                        continue
+                    multimodal_data_urls.append(data_url)
+                    if len(multimodal_data_urls) >= 9:
+                        break
+
+                headers = {"Content-Type": "application/json"}
+                token = str(runtime.get("api_key") or "").strip()
+                if token:
+                    if token.lower().startswith("bearer "):
+                        headers["Authorization"] = token
+                    else:
+                        headers["Authorization"] = f"Bearer {token}"
+
+                def _build_message_content(image_url_style: str) -> Any:
+                    if not multimodal_data_urls:
+                        return composed_text or "请根据输入内容进行回复。"
+                    content_items: List[Dict[str, Any]] = [{"type": "text", "text": composed_text or "请结合图片进行分析。"}]
+                    for url in multimodal_data_urls:
+                        if image_url_style == "string":
+                            content_items.append({"type": "image_url", "image_url": url})
+                        else:
+                            content_items.append({"type": "image_url", "image_url": {"url": url}})
+                    return content_items
+
+                style_attempts = ["object", "string"] if multimodal_data_urls else ["object"]
+                endpoint = str(runtime.get("endpoint") or "")
+                if multimodal_data_urls and "linkapi.org" in endpoint:
+                    style_attempts = ["string", "object"]
+
+                timeout_seconds = int(runtime.get("timeout_seconds") or 120)
+                style_succeeded = False
+                for attempt_index, style in enumerate(style_attempts):
+                    transient_retry_count = 0
+                    while True:
+                        attempt_has_delta = False
+                        request_payload: Dict[str, Any] = {
+                            "model": runtime["model"],
+                            "messages": [{"role": "user", "content": _build_message_content(style)}],
+                            "stream": True,
+                        }
+                        try:
+                            for delta in self._stream_openai_chat(
+                                endpoint=endpoint,
+                                headers=headers,
+                                payload=request_payload,
+                                timeout_seconds=timeout_seconds,
+                            ):
+                                if not delta:
+                                    continue
+                                attempt_has_delta = True
+                                accumulated += delta
+                                assistant_msg["text"] = accumulated
+                                yield _event_line({"type": "delta", "delta": delta, "assistant_text": accumulated})
+                            style_succeeded = True
+                            break
+                        except HTTPException as exc:
+                            detail = str(exc.detail or "")
+                            is_last = attempt_index >= (len(style_attempts) - 1)
+                            # 仅在多模态、且尚未返回任何 token 时，尝试 image_url 兼容格式切换
+                            if multimodal_data_urls and not attempt_has_delta and not accumulated and not is_last:
+                                if "EOF occurred in violation of protocol" in detail or "image_url" in detail.lower() or "invalid" in detail.lower():
+                                    break
+                            # 文本上游偶发网络抖动（SSL EOF/连接重置）时，且尚未产出 token，则自动重试一次
+                            if (
+                                not attempt_has_delta
+                                and not accumulated
+                                and transient_retry_count < TEXT_STREAM_TRANSIENT_MAX_RETRIES
+                                and self._is_transient_text_upstream_error(detail)
+                            ):
+                                transient_retry_count += 1
+                                backoff = min(1.2, 0.2 * (2 ** (transient_retry_count - 1))) + random.uniform(0.0, 0.08)
+                                time.sleep(backoff)
+                                continue
+                            raise
+                    if style_succeeded:
+                        break
+
+                assistant_msg["text"] = accumulated.strip() or "已完成。"
+                assistant_msg["status"] = "completed"
+                session["updated_at"] = _now_iso()
+                self._save_session_raw(session)
+                yield _event_line(
+                    {
+                        "type": "done",
+                        "user_message": self._hydrate_message_assets(user_msg),
+                        "assistant_message": self._hydrate_message_assets(assistant_msg),
+                    }
+                )
+            except GeneratorExit:
+                if assistant_msg.get("status") == "running":
+                    assistant_msg["text"] = "文本任务已中断（连接关闭），请重试。"
+                    assistant_msg["status"] = "failed"
+                    session["updated_at"] = _now_iso()
+                    self._save_session_raw(session)
+                raise
+            except HTTPException as exc:
+                detail = str(exc.detail or "文本生成失败")
+                assistant_msg["text"] = f"文本生成失败：{detail}"
+                assistant_msg["status"] = "failed"
+                session["updated_at"] = _now_iso()
+                self._save_session_raw(session)
+                yield _event_line(
+                    {
+                        "type": "error",
+                        "message": detail,
+                        "assistant_message": self._hydrate_message_assets(assistant_msg),
+                    }
+                )
+            except Exception as exc:
+                detail = str(exc)
+                assistant_msg["text"] = f"文本生成失败：{detail}"
+                assistant_msg["status"] = "failed"
+                session["updated_at"] = _now_iso()
+                self._save_session_raw(session)
+                yield _event_line(
+                    {
+                        "type": "error",
+                        "message": detail,
+                        "assistant_message": self._hydrate_message_assets(assistant_msg),
+                    }
+                )
+
+        return _generator()
 
     def delete_image_or_404(self, image_id: str) -> None:
         index = self._load_asset_index()
@@ -1928,6 +2764,994 @@ class StudioService:
         if not data:
             raise HTTPException(status_code=404, detail="Official asset not found")
         return Response(content=data, media_type="image/png")
+
+    def _workflow_run_file(self, run_id: str) -> Path:
+        return WORKFLOW_RUNS_DIR / f"{run_id}.json"
+
+    def _load_workflow_runs_index(self) -> List[Dict[str, Any]]:
+        payload = _read_json(WORKFLOW_RUNS_INDEX_FILE, [])
+        return payload if isinstance(payload, list) else []
+
+    def _save_workflow_runs_index(self, index: List[Dict[str, Any]]) -> None:
+        _write_json(WORKFLOW_RUNS_INDEX_FILE, index)
+
+    def _load_workflow_run_raw(self, run_id: str) -> Optional[Dict[str, Any]]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return None
+        payload = _read_json(self._workflow_run_file(rid), None)
+        return payload if isinstance(payload, dict) else None
+
+    def _save_workflow_run_raw(self, run_payload: Dict[str, Any]) -> None:
+        rid = str(run_payload.get("id") or "").strip()
+        if not rid:
+            raise HTTPException(status_code=400, detail="run_id 不能为空")
+        lock = self._get_workflow_run_lock(rid)
+        with lock:
+            payload = dict(run_payload)
+            payload["updated_at"] = _now_iso()
+            _write_json(self._workflow_run_file(rid), payload)
+
+            index = self._load_workflow_runs_index()
+            found = False
+            for item in index:
+                if str(item.get("id") or "").strip() != rid:
+                    continue
+                item.update(
+                    {
+                        "id": rid,
+                        "name": str(payload.get("name") or ""),
+                        "status": str(payload.get("status") or "idle"),
+                        "workspace_id": str(payload.get("workspace_id") or ""),
+                        "created_at": str(payload.get("created_at") or item.get("created_at") or _now_iso()),
+                        "updated_at": str(payload.get("updated_at") or _now_iso()),
+                    }
+                )
+                found = True
+                break
+            if not found:
+                index.append(
+                    {
+                        "id": rid,
+                        "name": str(payload.get("name") or ""),
+                        "status": str(payload.get("status") or "idle"),
+                        "workspace_id": str(payload.get("workspace_id") or ""),
+                        "created_at": str(payload.get("created_at") or _now_iso()),
+                        "updated_at": str(payload.get("updated_at") or _now_iso()),
+                    }
+                )
+            index.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            self._save_workflow_runs_index(index)
+
+    def list_workflow_runs(self) -> List[Dict[str, Any]]:
+        return self._load_workflow_runs_index()
+
+    def get_workflow_run_or_404(self, run_id: str) -> Dict[str, Any]:
+        payload = self._load_workflow_run_raw(run_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="运行记录不存在")
+        return payload
+
+    def _normalize_workflow_combination_mode(self, mode: Any) -> str:
+        value = str(mode or "").strip().lower()
+        if value in {"broadcast", "pairwise", "cartesian"}:
+            return value
+        return "broadcast"
+
+    def _normalize_workflow_assets(self, raw_assets: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_assets, list):
+            raw_assets = []
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for index, item in enumerate(raw_assets, start=1):
+            aid = ""
+            title = ""
+            if isinstance(item, str):
+                aid = item.strip()
+            elif isinstance(item, dict):
+                aid = str(item.get("id") or item.get("asset_id") or "").strip()
+                title = str(item.get("title") or "").strip()
+            if not aid or aid in seen:
+                continue
+            asset = self._resolve_asset(aid)
+            if not asset:
+                raise HTTPException(status_code=400, detail=f"素材不存在：{aid}")
+            seen.add(aid)
+            result.append(
+                {
+                    "id": aid,
+                    "title": title or str(asset.get("title") or f"素材{index}"),
+                }
+            )
+        if not result:
+            raise HTTPException(status_code=400, detail="请至少提供 1 个有效素材")
+        return result
+
+    def _normalize_workflow_prompts(self, raw_prompts: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_prompts, list):
+            raw_prompts = []
+        result: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_prompts, start=1):
+            pid = ""
+            text = ""
+            title = ""
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                pid = str(item.get("id") or "").strip()
+                title = str(item.get("title") or "").strip()
+                text = str(item.get("text") or item.get("prompt") or item.get("content") or "").strip()
+            if not text:
+                continue
+            result.append(
+                {
+                    "id": pid or f"prompt-{index}",
+                    "title": title or f"提示词{index}",
+                    "text": text,
+                }
+            )
+        if not result:
+            raise HTTPException(status_code=400, detail="请至少提供 1 条有效提示词")
+        return result
+
+    def _normalize_workflow_recipes(self, raw_recipes: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_recipes, list):
+            raw_recipes = []
+        result: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_recipes, start=1):
+            recipe = item if isinstance(item, dict) else {}
+            if recipe and not bool(recipe.get("enabled", True)):
+                continue
+            rid = str(recipe.get("id") or f"recipe-{index}").strip() or f"recipe-{index}"
+            name = str(recipe.get("name") or f"配方{index}").strip() or f"配方{index}"
+            prompt_template = str(recipe.get("prompt_template") or recipe.get("template") or "").strip()
+            model = str(recipe.get("model") or MODEL_OPTIONS[0]["id"]).strip() or MODEL_OPTIONS[0]["id"]
+            aspect_ratio = _normalize_aspect_ratio(str(recipe.get("aspect_ratio") or "3:4"))
+            quality = _normalize_quality(str(recipe.get("quality") or "2K"))
+
+            refs_raw = recipe.get("reference_asset_ids")
+            refs: List[str] = []
+            if isinstance(refs_raw, list):
+                for aid in refs_raw:
+                    text = str(aid or "").strip()
+                    if not text or text in refs:
+                        continue
+                    if self._resolve_asset(text) is None:
+                        raise HTTPException(status_code=400, detail=f"配方引用素材不存在：{text}")
+                    refs.append(text)
+
+            result.append(
+                {
+                    "id": rid,
+                    "name": name,
+                    "prompt_template": prompt_template,
+                    "model": model,
+                    "aspect_ratio": aspect_ratio,
+                    "quality": quality,
+                    "reference_asset_ids": refs,
+                }
+            )
+        if not result:
+            result.append(
+                {
+                    "id": "recipe-1",
+                    "name": "默认配方",
+                    "prompt_template": "",
+                    "model": MODEL_OPTIONS[0]["id"],
+                    "aspect_ratio": "3:4",
+                    "quality": "2K",
+                    "reference_asset_ids": [],
+                }
+            )
+        return result
+
+    def _normalize_workflow_slot_bindings(self, raw_bindings: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_bindings, list):
+            raw_bindings = []
+        bindings: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item in raw_bindings:
+            if not isinstance(item, dict):
+                continue
+            slot_name = str(item.get("slot_name") or item.get("name") or "").strip()
+            if not slot_name or slot_name in seen:
+                continue
+            slot_type = str(item.get("slot_type") or item.get("type") or "dynamic").strip().lower()
+            if slot_type not in {"dynamic", "fixed"}:
+                slot_type = "dynamic"
+            required = bool(item.get("required", True))
+            asset_id = str(item.get("asset_id") or "").strip()
+            if required and not asset_id:
+                raise HTTPException(status_code=400, detail=f"槽位缺少素材绑定：{slot_name}")
+            if asset_id and self._resolve_asset(asset_id) is None:
+                raise HTTPException(status_code=400, detail=f"槽位素材不存在：{asset_id}")
+            bindings.append(
+                {
+                    "slot_name": slot_name,
+                    "slot_type": slot_type,
+                    "required": required,
+                    "asset_id": asset_id,
+                }
+            )
+            seen.add(slot_name)
+        return bindings
+
+    def _extract_workflow_mentions(self, text: str) -> List[str]:
+        mentions: List[str] = []
+        source = str(text or "")
+        for match in WORKFLOW_MENTION_PATTERN.finditer(source):
+            token = str(match.group(1) or "").strip()
+            if not token or token in mentions:
+                continue
+            mentions.append(token)
+        return mentions
+
+    def _validate_workflow_mentions(
+        self,
+        *,
+        prompts: List[Dict[str, Any]],
+        recipes: List[Dict[str, Any]],
+        slot_bindings: List[Dict[str, Any]],
+    ) -> None:
+        slot_map: Dict[str, Dict[str, Any]] = {
+            str(item.get("slot_name") or "").strip(): item for item in slot_bindings if isinstance(item, dict)
+        }
+        allowed_mentions = set(slot_map.keys()) | set(WORKFLOW_PRIMARY_ASSET_MENTIONS)
+
+        mentions_in_prompts: List[str] = []
+        for prompt in prompts:
+            mentions_in_prompts.extend(self._extract_workflow_mentions(str(prompt.get("text") or "")))
+        mentions_in_templates: List[str] = []
+        for recipe in recipes:
+            mentions_in_templates.extend(self._extract_workflow_mentions(str(recipe.get("prompt_template") or "")))
+
+        seen_mentions: List[str] = []
+        for token in mentions_in_prompts + mentions_in_templates:
+            if token not in seen_mentions:
+                seen_mentions.append(token)
+
+        invalid = [token for token in seen_mentions if token not in allowed_mentions]
+        if invalid:
+            invalid_text = "、".join([f"@{token}" for token in invalid])
+            raise HTTPException(status_code=400, detail=f"检测到未定义引用：{invalid_text}")
+
+        missing_bound_slots = []
+        for token in seen_mentions:
+            slot = slot_map.get(token)
+            if slot and not str(slot.get("asset_id") or "").strip():
+                missing_bound_slots.append(token)
+        if missing_bound_slots:
+            missing_text = "、".join([f"@{token}" for token in missing_bound_slots])
+            raise HTTPException(status_code=400, detail=f"引用槽位未绑定素材：{missing_text}")
+
+    def _build_workflow_pairs(
+        self,
+        *,
+        assets: List[Dict[str, Any]],
+        prompts: List[Dict[str, Any]],
+        combination_mode: str,
+    ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        mode = self._normalize_workflow_combination_mode(combination_mode)
+        pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        if mode == "broadcast":
+            if len(assets) == 1:
+                pairs = [(assets[0], prompt) for prompt in prompts]
+            elif len(prompts) == 1:
+                pairs = [(asset, prompts[0]) for asset in assets]
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="广播模式要求素材或提示词其中一侧数量为 1",
+                )
+        elif mode == "pairwise":
+            if len(assets) != len(prompts):
+                raise HTTPException(status_code=400, detail="一一对应模式要求素材数量与提示词数量一致")
+            pairs = list(zip(assets, prompts))
+        else:
+            for asset in assets:
+                for prompt in prompts:
+                    pairs.append((asset, prompt))
+        if len(pairs) == 0:
+            raise HTTPException(status_code=400, detail="未生成有效任务对，请检查输入")
+        return pairs
+
+    def _resolve_workflow_slot_assets(self, slot_bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        slot_assets: List[Dict[str, str]] = []
+        for item in slot_bindings:
+            if not isinstance(item, dict):
+                continue
+            slot_name = str(item.get("slot_name") or "").strip()
+            asset_id = str(item.get("asset_id") or "").strip()
+            if not slot_name or not asset_id:
+                continue
+            asset = self._resolve_asset(asset_id)
+            if not asset:
+                continue
+            slot_assets.append(
+                {
+                    "slot_name": slot_name,
+                    "asset_id": asset_id,
+                    "asset_title": str(asset.get("title") or asset_id),
+                }
+            )
+        return slot_assets
+
+    def _compose_slot_binding_hint(self, slot_assets: List[Dict[str, str]]) -> str:
+        if not slot_assets:
+            return ""
+        lines = ["[参考槽位绑定]"]
+        for item in slot_assets:
+            lines.append(
+                f"- {item.get('slot_name')}: {item.get('asset_title') or item.get('asset_id')} (asset_id={item.get('asset_id')})"
+            )
+        return "\n".join(lines)
+
+    def _compose_recipe_prompt(
+        self,
+        *,
+        base_prompt: str,
+        recipe: Dict[str, Any],
+        asset: Dict[str, Any],
+        slot_assets: List[Dict[str, str]],
+    ) -> str:
+        prompt_text = str(base_prompt or "").strip()
+        template = str(recipe.get("prompt_template") or "").strip()
+        if template:
+            if "{{prompt}}" in template:
+                prompt_text = template.replace("{{prompt}}", prompt_text)
+            else:
+                prompt_text = f"{template}\n\n{prompt_text}".strip()
+        prompt_text = prompt_text.replace("{{asset_title}}", str(asset.get("title") or ""))
+        prompt_text = prompt_text.replace("{{asset_id}}", str(asset.get("id") or ""))
+        primary_asset_text = str(asset.get("title") or asset.get("id") or "")
+        for token in ("@input_asset", "@主素材"):
+            if token in prompt_text:
+                prompt_text = prompt_text.replace(token, f"[主素材:{primary_asset_text}]")
+        for slot in slot_assets:
+            slot_name = str(slot.get("slot_name") or "").strip()
+            if not slot_name:
+                continue
+            token = f"@{slot_name}"
+            if token in prompt_text:
+                replacement = f"[{slot_name}:{slot.get('asset_title') or slot.get('asset_id')}]"
+                prompt_text = prompt_text.replace(token, replacement)
+        slot_hint = self._compose_slot_binding_hint(slot_assets)
+        if slot_hint:
+            prompt_text = f"{prompt_text}\n\n{slot_hint}".strip()
+        return prompt_text.strip()
+
+    def _expand_workflow_tasks(
+        self,
+        *,
+        assets: List[Dict[str, Any]],
+        prompts: List[Dict[str, Any]],
+        recipes: List[Dict[str, Any]],
+        slot_bindings: List[Dict[str, Any]],
+        combination_mode: str,
+        variants_per_item: int,
+    ) -> List[Dict[str, Any]]:
+        pairs = self._build_workflow_pairs(assets=assets, prompts=prompts, combination_mode=combination_mode)
+        variants = max(1, min(int(variants_per_item or 1), 8))
+        slot_assets = self._resolve_workflow_slot_assets(slot_bindings)
+        tasks: List[Dict[str, Any]] = []
+        for asset, prompt in pairs:
+            for recipe in recipes:
+                for variant_index in range(1, variants + 1):
+                    composed_prompt = self._compose_recipe_prompt(
+                        base_prompt=str(prompt.get("text") or ""),
+                        recipe=recipe,
+                        asset=asset,
+                        slot_assets=slot_assets,
+                    )
+                    attachment_ids: List[str] = []
+                    source_aid = str(asset.get("id") or "").strip()
+                    if source_aid:
+                        attachment_ids.append(source_aid)
+                    for slot_item in slot_assets:
+                        aid = str(slot_item.get("asset_id") or "").strip()
+                        if aid and aid not in attachment_ids:
+                            attachment_ids.append(aid)
+                    for ref in recipe.get("reference_asset_ids") or []:
+                        aid = str(ref or "").strip()
+                        if aid and aid not in attachment_ids:
+                            attachment_ids.append(aid)
+                    tasks.append(
+                        {
+                            "id": f"wf-task-{uuid.uuid4().hex[:10]}",
+                            "source_asset_id": source_aid,
+                            "source_asset_title": str(asset.get("title") or source_aid),
+                            "prompt_id": str(prompt.get("id") or ""),
+                            "prompt_title": str(prompt.get("title") or ""),
+                            "prompt_text": str(prompt.get("text") or ""),
+                            "recipe_id": str(recipe.get("id") or ""),
+                            "recipe_name": str(recipe.get("name") or ""),
+                            "variant_index": variant_index,
+                            "effective_prompt": composed_prompt,
+                            "params": {
+                                "model": str(recipe.get("model") or MODEL_OPTIONS[0]["id"]),
+                                "aspect_ratio": _normalize_aspect_ratio(str(recipe.get("aspect_ratio") or "3:4")),
+                                "quality": _normalize_quality(str(recipe.get("quality") or "2K")),
+                                "count": 1,
+                            },
+                            "attachment_asset_ids": attachment_ids,
+                            "slot_assets": [dict(item) for item in slot_assets],
+                            "status": "pending",
+                            "error": "",
+                            "elapsed_seconds": 0,
+                            "started_at": "",
+                            "finished_at": "",
+                            "result": {},
+                        }
+                    )
+        if len(tasks) > WORKFLOW_RUN_MAX_TASKS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"任务总数 {len(tasks)} 超出上限 {WORKFLOW_RUN_MAX_TASKS}，请减少输入规模",
+            )
+        return tasks
+
+    def _build_workflow_preview_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        assets = self._normalize_workflow_assets(payload.get("assets"))
+        prompts = self._normalize_workflow_prompts(payload.get("prompts"))
+        recipes = self._normalize_workflow_recipes(payload.get("recipes"))
+        slot_bindings = self._normalize_workflow_slot_bindings(payload.get("slot_bindings"))
+        self._validate_workflow_mentions(prompts=prompts, recipes=recipes, slot_bindings=slot_bindings)
+        combination_mode = self._normalize_workflow_combination_mode(payload.get("combination_mode"))
+        variants_per_item = max(1, min(int(payload.get("variants_per_item") or 1), 8))
+        concurrency = max(1, min(int(payload.get("concurrency") or 2), 8))
+        tasks = self._expand_workflow_tasks(
+            assets=assets,
+            prompts=prompts,
+            recipes=recipes,
+            slot_bindings=slot_bindings,
+            combination_mode=combination_mode,
+            variants_per_item=variants_per_item,
+        )
+        sample = [
+            {
+                "task_id": item.get("id"),
+                "source_asset_id": item.get("source_asset_id"),
+                "source_asset_title": item.get("source_asset_title"),
+                "prompt_id": item.get("prompt_id"),
+                "recipe_id": item.get("recipe_id"),
+                "variant_index": item.get("variant_index"),
+                "prompt_preview": str(item.get("effective_prompt") or "")[:120],
+                "slot_assets": item.get("slot_assets") if isinstance(item.get("slot_assets"), list) else [],
+                "attachment_asset_ids": item.get("attachment_asset_ids") if isinstance(item.get("attachment_asset_ids"), list) else [],
+            }
+            for item in tasks[: min(5, len(tasks))]
+        ]
+        expanded_tasks = [
+            {
+                "task_id": item.get("id"),
+                "source_asset_id": item.get("source_asset_id"),
+                "source_asset_title": item.get("source_asset_title"),
+                "prompt_id": item.get("prompt_id"),
+                "prompt_title": item.get("prompt_title"),
+                "prompt_text": item.get("prompt_text"),
+                "recipe_id": item.get("recipe_id"),
+                "recipe_name": item.get("recipe_name"),
+                "variant_index": item.get("variant_index"),
+                "effective_prompt": item.get("effective_prompt"),
+                "slot_assets": item.get("slot_assets") if isinstance(item.get("slot_assets"), list) else [],
+                "attachment_asset_ids": item.get("attachment_asset_ids") if isinstance(item.get("attachment_asset_ids"), list) else [],
+            }
+            for item in tasks
+        ]
+        return {
+            "assets": assets,
+            "prompts": prompts,
+            "recipes": recipes,
+            "slot_bindings": slot_bindings,
+            "combination_mode": combination_mode,
+            "variants_per_item": variants_per_item,
+            "concurrency": concurrency,
+            "tasks": tasks,
+            "total_tasks": len(tasks),
+            "limit": WORKFLOW_RUN_MAX_TASKS,
+            "sample_tasks": sample,
+            "expanded_tasks": expanded_tasks,
+        }
+
+    def preview_workflow_run(self, payload: WorkflowRunPreviewRequest) -> Dict[str, Any]:
+        built = self._build_workflow_preview_payload(payload.model_dump())
+        return {
+            "combination_mode": built["combination_mode"],
+            "variants_per_item": built["variants_per_item"],
+            "concurrency": built["concurrency"],
+            "total_tasks": built["total_tasks"],
+            "limit": built["limit"],
+            "assets_count": len(built["assets"]),
+            "prompts_count": len(built["prompts"]),
+            "recipes_count": len(built["recipes"]),
+            "sample_tasks": built["sample_tasks"],
+            "expanded_tasks": built["expanded_tasks"],
+            "slot_bindings": built["slot_bindings"],
+        }
+
+    def _calc_workflow_run_summary(self, tasks: List[Dict[str, Any]]) -> Dict[str, int]:
+        summary = {"total": len(tasks), "pending": 0, "running": 0, "completed": 0, "failed": 0}
+        for item in tasks:
+            status = str(item.get("status") or "pending").strip().lower()
+            if status in summary:
+                summary[status] += 1
+            elif status == "paused":
+                summary["pending"] += 1
+            else:
+                summary["pending"] += 1
+        return summary
+
+    def _execute_workflow_task(self, workspace_id: str, task: Dict[str, Any]) -> Dict[str, Any]:
+        started = time.monotonic()
+        try:
+            turn = self.create_turn(
+                session_id=workspace_id,
+                text=str(task.get("effective_prompt") or ""),
+                params=task.get("params") if isinstance(task.get("params"), dict) else {},
+                attachment_asset_ids=list(task.get("attachment_asset_ids") or []),
+                references=[],
+                annotation_context={},
+                annotation_contexts=[],
+            )
+            assistant = turn.get("assistant_message") if isinstance(turn, dict) else {}
+            images = assistant.get("images") if isinstance(assistant, dict) else []
+            image_asset_ids: List[str] = []
+            if isinstance(images, list):
+                for item in images:
+                    if not isinstance(item, dict):
+                        continue
+                    aid = str(item.get("id") or "").strip()
+                    if aid:
+                        image_asset_ids.append(aid)
+            elapsed_seconds = max(1, int(time.monotonic() - started))
+            return {
+                "ok": True,
+                "elapsed_seconds": elapsed_seconds,
+                "output": {
+                    "assistant_text": str((assistant or {}).get("text") or ""),
+                    "image_asset_ids": image_asset_ids,
+                },
+            }
+        except Exception as exc:
+            elapsed_seconds = max(1, int(time.monotonic() - started))
+            detail = str(exc)
+            if isinstance(exc, HTTPException):
+                detail = str(exc.detail or detail)
+            return {
+                "ok": False,
+                "elapsed_seconds": elapsed_seconds,
+                "error": detail or "任务执行失败",
+                "output": {},
+            }
+
+    def _get_run_task_by_id(self, run_payload: Dict[str, Any], task_id: str) -> Optional[Dict[str, Any]]:
+        tasks = run_payload.get("tasks")
+        if not isinstance(tasks, list):
+            return None
+        for item in tasks:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "").strip() == task_id:
+                return item
+        return None
+
+    def _execute_workflow_run_background(self, run_id: str) -> None:
+        try:
+            run_payload = self.get_workflow_run_or_404(run_id)
+            if str(run_payload.get("status") or "") != "running":
+                return
+            workspace_id = str(run_payload.get("workspace_id") or "").strip()
+            tasks = run_payload.get("tasks")
+            if not workspace_id or not isinstance(tasks, list):
+                run_payload["status"] = "failed"
+                run_payload["error"] = "运行记录缺少 workspace 或任务列表"
+                run_payload["summary"] = self._calc_workflow_run_summary(tasks if isinstance(tasks, list) else [])
+                self._save_workflow_run_raw(run_payload)
+                return
+
+            concurrency = max(1, min(int(run_payload.get("concurrency") or 2), 8))
+            stop_dispatch = False
+            pending_ids = [
+                str(item.get("id") or "")
+                for item in tasks
+                if isinstance(item, dict) and str(item.get("status") or "pending") == "pending"
+            ]
+            future_map: Dict[concurrent.futures.Future, str] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                while pending_ids and not stop_dispatch and len(future_map) < concurrency:
+                    task_id = pending_ids.pop(0)
+                    task = self._get_run_task_by_id(run_payload, task_id)
+                    if not task:
+                        continue
+                    task["status"] = "running"
+                    task["started_at"] = _now_iso()
+                    task["error"] = ""
+                    run_payload["summary"] = self._calc_workflow_run_summary(tasks)
+                    self._save_workflow_run_raw(run_payload)
+                    future = executor.submit(self._execute_workflow_task, workspace_id, dict(task))
+                    future_map[future] = task_id
+
+                while future_map:
+                    done, _ = concurrent.futures.wait(
+                        list(future_map.keys()),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        task_id = future_map.pop(future)
+                        task = self._get_run_task_by_id(run_payload, task_id)
+                        if not task:
+                            continue
+                        result = future.result()
+                        task["elapsed_seconds"] = int(result.get("elapsed_seconds") or 0)
+                        task["finished_at"] = _now_iso()
+                        task["result"] = result.get("output") if isinstance(result.get("output"), dict) else {}
+                        if bool(result.get("ok")):
+                            task["status"] = "completed"
+                            task["error"] = ""
+                        else:
+                            task["status"] = "failed"
+                            task["error"] = str(result.get("error") or "任务执行失败")
+                            stop_dispatch = True
+                        run_payload["summary"] = self._calc_workflow_run_summary(tasks)
+                        self._save_workflow_run_raw(run_payload)
+
+                    while pending_ids and not stop_dispatch and len(future_map) < concurrency:
+                        task_id = pending_ids.pop(0)
+                        task = self._get_run_task_by_id(run_payload, task_id)
+                        if not task:
+                            continue
+                        task["status"] = "running"
+                        task["started_at"] = _now_iso()
+                        task["error"] = ""
+                        run_payload["summary"] = self._calc_workflow_run_summary(tasks)
+                        self._save_workflow_run_raw(run_payload)
+                        future = executor.submit(self._execute_workflow_task, workspace_id, dict(task))
+                        future_map[future] = task_id
+
+            summary = self._calc_workflow_run_summary(tasks)
+            run_payload["summary"] = summary
+            run_payload["status"] = "paused" if summary.get("failed", 0) > 0 else "completed"
+            self._save_workflow_run_raw(run_payload)
+        finally:
+            with self._workflow_runner_guard:
+                self._workflow_runner_threads.pop(str(run_id or "").strip(), None)
+
+    def _start_workflow_run_background(self, run_id: str) -> None:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        with self._workflow_runner_guard:
+            existing = self._workflow_runner_threads.get(rid)
+            if existing and existing.is_alive():
+                return
+            thread = threading.Thread(target=self._execute_workflow_run_background, args=(rid,), daemon=True)
+            self._workflow_runner_threads[rid] = thread
+            thread.start()
+
+    def create_workflow_run(self, payload: WorkflowRunCreateRequest) -> Dict[str, Any]:
+        built = self._build_workflow_preview_payload(payload.model_dump())
+        requested_workspace_id = str(payload.workspace_id or "").strip()
+        workspace_id = requested_workspace_id
+        if requested_workspace_id:
+            if not self._load_session_raw(requested_workspace_id):
+                raise HTTPException(status_code=404, detail="workspace_id 不存在")
+        else:
+            created = self.create_session(str(payload.name or "工作流批运行").strip() or "工作流批运行")
+            workspace_id = str(created.get("id") or "").strip()
+
+        now = _now_iso()
+        run_payload = {
+            "id": f"wf-run-{uuid.uuid4().hex[:10]}",
+            "name": str(payload.name or "工作流批运行").strip() or "工作流批运行",
+            "workspace_id": workspace_id,
+            "status": "running",
+            "combination_mode": built["combination_mode"],
+            "variants_per_item": built["variants_per_item"],
+            "concurrency": built["concurrency"],
+            "limit": built["limit"],
+            "assets": built["assets"],
+            "prompts": built["prompts"],
+            "recipes": built["recipes"],
+            "slot_bindings": built["slot_bindings"],
+            "tasks": built["tasks"],
+            "summary": self._calc_workflow_run_summary(built["tasks"]),
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._save_workflow_run_raw(run_payload)
+        self._start_workflow_run_background(run_payload["id"])
+        return run_payload
+
+    def retry_workflow_run_task(self, run_id: str, task_id: str) -> Dict[str, Any]:
+        rid = str(run_id or "").strip()
+        tid = str(task_id or "").strip()
+        if not rid or not tid:
+            raise HTTPException(status_code=400, detail="run_id/task_id 不能为空")
+        run_payload = self.get_workflow_run_or_404(rid)
+        if str(run_payload.get("status") or "").strip() == "running":
+            raise HTTPException(status_code=409, detail="运行中不可重试，请稍后再试")
+        task = self._get_run_task_by_id(run_payload, tid)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if str(task.get("status") or "").strip() != "failed":
+            raise HTTPException(status_code=400, detail="仅失败任务可重试")
+
+        workspace_id = str(run_payload.get("workspace_id") or "").strip()
+        if not workspace_id or self._load_session_raw(workspace_id) is None:
+            raise HTTPException(status_code=404, detail="运行关联 workspace 不存在")
+
+        task["status"] = "running"
+        task["started_at"] = _now_iso()
+        task["finished_at"] = ""
+        task["elapsed_seconds"] = 0
+        task["error"] = ""
+        task["result"] = {}
+        run_payload["status"] = "running"
+        run_payload["summary"] = self._calc_workflow_run_summary(run_payload.get("tasks") if isinstance(run_payload.get("tasks"), list) else [])
+        self._save_workflow_run_raw(run_payload)
+
+        result = self._execute_workflow_task(workspace_id, dict(task))
+        task["elapsed_seconds"] = int(result.get("elapsed_seconds") or 0)
+        task["finished_at"] = _now_iso()
+        task["result"] = result.get("output") if isinstance(result.get("output"), dict) else {}
+        if bool(result.get("ok")):
+            task["status"] = "completed"
+            task["error"] = ""
+        else:
+            task["status"] = "failed"
+            task["error"] = str(result.get("error") or "任务执行失败")
+
+        run_payload["summary"] = self._calc_workflow_run_summary(run_payload.get("tasks") if isinstance(run_payload.get("tasks"), list) else [])
+        if int(run_payload["summary"].get("failed", 0)) > 0:
+            run_payload["status"] = "paused"
+        elif int(run_payload["summary"].get("pending", 0)) > 0:
+            run_payload["status"] = "running"
+        else:
+            run_payload["status"] = "completed"
+        self._save_workflow_run_raw(run_payload)
+
+        if str(run_payload.get("status") or "") == "running":
+            self._start_workflow_run_background(rid)
+        return run_payload
+
+    def _load_workflow_templates(self) -> List[Dict[str, Any]]:
+        payload = _read_json(WORKFLOW_TEMPLATES_FILE, [])
+        return payload if isinstance(payload, list) else []
+
+    def _save_workflow_templates(self, templates: List[Dict[str, Any]]) -> None:
+        _write_json(WORKFLOW_TEMPLATES_FILE, templates)
+
+    def list_workflow_templates(self) -> List[Dict[str, Any]]:
+        templates = self._load_workflow_templates()
+        templates.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return templates
+
+    def create_workflow_template(self, payload: WorkflowTemplateCreateRequest) -> Dict[str, Any]:
+        name = str(payload.name or "").strip() or "未命名模板"
+        description = str(payload.description or "").strip()
+        graph = payload.graph if isinstance(payload.graph, dict) else {}
+        tags = [str(item or "").strip() for item in (payload.tags or [])]
+        normalized_tags = [tag for tag in tags if tag]
+
+        now = _now_iso()
+        template = {
+            "id": f"wf-template-{uuid.uuid4().hex[:10]}",
+            "name": name,
+            "description": description,
+            "graph": graph,
+            "tags": normalized_tags,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        templates = self._load_workflow_templates()
+        templates.append(template)
+        self._save_workflow_templates(templates)
+        return template
+
+    def update_workflow_template(self, template_id: str, payload: WorkflowTemplateUpdateRequest) -> Dict[str, Any]:
+        target_id = str(template_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="模板 ID 不能为空")
+
+        templates = self._load_workflow_templates()
+        for idx, item in enumerate(templates):
+            if str(item.get("id") or "").strip() != target_id:
+                continue
+            next_item = dict(item)
+            if payload.name is not None:
+                name = str(payload.name or "").strip()
+                if name:
+                    next_item["name"] = name
+            if payload.description is not None:
+                next_item["description"] = str(payload.description or "").strip()
+            if payload.graph is not None:
+                next_item["graph"] = payload.graph if isinstance(payload.graph, dict) else {}
+            if payload.tags is not None:
+                tags = [str(tag or "").strip() for tag in payload.tags]
+                next_item["tags"] = [tag for tag in tags if tag]
+            next_item["updated_at"] = _now_iso()
+            templates[idx] = next_item
+            self._save_workflow_templates(templates)
+            return next_item
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    def delete_workflow_template(self, template_id: str) -> None:
+        target_id = str(template_id or "").strip()
+        templates = self._load_workflow_templates()
+        next_templates = [item for item in templates if str(item.get("id") or "").strip() != target_id]
+        if len(next_templates) == len(templates):
+            raise HTTPException(status_code=404, detail="模板不存在")
+        self._save_workflow_templates(next_templates)
+
+    def _load_workflow_prompt_cards(self) -> List[Dict[str, Any]]:
+        payload = _read_json(WORKFLOW_PROMPT_CARDS_FILE, [])
+        return payload if isinstance(payload, list) else []
+
+    def _save_workflow_prompt_cards(self, cards: List[Dict[str, Any]]) -> None:
+        _write_json(WORKFLOW_PROMPT_CARDS_FILE, cards)
+
+    def list_workflow_prompt_cards(self) -> List[Dict[str, Any]]:
+        cards = self._load_workflow_prompt_cards()
+        cards.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return cards
+
+    def create_workflow_prompt_card(self, payload: WorkflowPromptCardCreateRequest) -> Dict[str, Any]:
+        name = str(payload.name or "").strip() or "未命名指令卡片"
+        text = str(payload.text or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="指令内容不能为空")
+        tags = [str(item or "").strip() for item in (payload.tags or [])]
+        normalized_tags = [tag for tag in tags if tag]
+
+        now = _now_iso()
+        card = {
+            "id": f"wf-prompt-card-{uuid.uuid4().hex[:10]}",
+            "name": name,
+            "text": text,
+            "tags": normalized_tags,
+            "created_at": now,
+            "updated_at": now,
+        }
+        cards = self._load_workflow_prompt_cards()
+        cards.append(card)
+        self._save_workflow_prompt_cards(cards)
+        return card
+
+    def update_workflow_prompt_card(self, card_id: str, payload: WorkflowPromptCardUpdateRequest) -> Dict[str, Any]:
+        target_id = str(card_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="卡片 ID 不能为空")
+
+        cards = self._load_workflow_prompt_cards()
+        for idx, item in enumerate(cards):
+            if str(item.get("id") or "").strip() != target_id:
+                continue
+            next_item = dict(item)
+            if payload.name is not None:
+                next_item["name"] = str(payload.name or "").strip() or "未命名指令卡片"
+            if payload.text is not None:
+                text = str(payload.text or "").strip()
+                if not text:
+                    raise HTTPException(status_code=400, detail="指令内容不能为空")
+                next_item["text"] = text
+            if payload.tags is not None:
+                tags = [str(tag or "").strip() for tag in payload.tags]
+                next_item["tags"] = [tag for tag in tags if tag]
+            next_item["updated_at"] = _now_iso()
+            cards[idx] = next_item
+            self._save_workflow_prompt_cards(cards)
+            return next_item
+        raise HTTPException(status_code=404, detail="指令卡片不存在")
+
+    def delete_workflow_prompt_card(self, card_id: str) -> None:
+        target_id = str(card_id or "").strip()
+        cards = self._load_workflow_prompt_cards()
+        next_cards = [item for item in cards if str(item.get("id") or "").strip() != target_id]
+        if len(next_cards) == len(cards):
+            raise HTTPException(status_code=404, detail="指令卡片不存在")
+        self._save_workflow_prompt_cards(next_cards)
+
+    def _normalize_workflow_bridge_config(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            payload = {}
+        base_url = str(payload.get("base_url") or DEFAULT_WORKFLOW_BRIDGE_CONFIG["base_url"]).strip()
+        if not base_url:
+            base_url = DEFAULT_WORKFLOW_BRIDGE_CONFIG["base_url"]
+        base_url = base_url.rstrip("/")
+        enabled = bool(payload.get("enabled", DEFAULT_WORKFLOW_BRIDGE_CONFIG["enabled"]))
+        return {"base_url": base_url, "enabled": enabled}
+
+    def get_workflow_bridge_config(self) -> Dict[str, Any]:
+        payload = _read_json(WORKFLOW_BRIDGE_CONFIG_FILE, DEFAULT_WORKFLOW_BRIDGE_CONFIG)
+        normalized = self._normalize_workflow_bridge_config(payload)
+        return normalized
+
+    def update_workflow_bridge_config(self, payload: WorkflowBridgeConfigRequest) -> Dict[str, Any]:
+        next_config = self._normalize_workflow_bridge_config(payload.model_dump())
+        _write_json(WORKFLOW_BRIDGE_CONFIG_FILE, next_config)
+        return next_config
+
+    def _request_workflow_bridge_json(
+        self,
+        path: str,
+        query: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        bridge_cfg = self.get_workflow_bridge_config()
+        base_url = str(bridge_cfg.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Bridge base_url 未配置")
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = f"{base_url}{normalized_path}"
+        if query:
+            encoded = urlencode(
+                {k: v for k, v in query.items() if v is not None and str(v) != ""},
+                doseq=True,
+            )
+            if encoded:
+                url = f"{url}?{encoded}"
+
+        req = urllib_request.Request(
+            url,
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=25) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8")
+            except Exception:
+                detail = str(exc.reason or "")
+            detail = detail.strip()[:260]
+            raise HTTPException(status_code=502, detail=f"Bridge 请求失败：HTTP {exc.code} {detail}".strip()) from exc
+        except urllib_error.URLError as exc:
+            raise HTTPException(status_code=502, detail=f"Bridge 网络错误：{exc.reason}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Bridge 请求异常：{exc}") from exc
+
+        try:
+            return json.loads(raw or "{}")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Bridge 返回非 JSON") from exc
+
+    def bridge_get_options(self) -> Dict[str, Any]:
+        payload = self._request_workflow_bridge_json("/api/v1/options")
+        return payload if isinstance(payload, dict) else {}
+
+    def bridge_list_workspaces(self) -> List[Dict[str, Any]]:
+        payload = self._request_workflow_bridge_json("/api/v1/workspaces")
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def bridge_get_workspace(self, workspace_id: str) -> Dict[str, Any]:
+        sid = str(workspace_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail="workspace_id 不能为空")
+        payload = self._request_workflow_bridge_json(f"/api/v1/workspaces/{sid}")
+        return payload if isinstance(payload, dict) else {}
+
+    def bridge_list_assets(
+        self,
+        cursor: Optional[str] = None,
+        limit: int = 80,
+        kind: Optional[str] = None,
+        search: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = self._request_workflow_bridge_json(
+            "/api/v1/assets/library",
+            query={
+                "cursor": cursor,
+                "limit": max(1, min(int(limit or 80), 200)),
+                "kind": kind,
+                "search": search,
+                "workspace_id": workspace_id,
+            },
+        )
+        return payload if isinstance(payload, dict) else {"items": [], "has_more": False, "next_cursor": None, "total": 0}
 
 
 app_service = StudioService()

@@ -10,6 +10,8 @@ import type {
   OfficialTaxonomies,
   RuntimeConfig,
   StudioAsset,
+  StudioComposerMode,
+  StudioMessage,
   StudioOptions,
   TurnResult,
   WorkspaceDetail,
@@ -68,6 +70,55 @@ export function getApiBase(): string {
   return API_BASE || BROWSER_ORIGIN || '';
 }
 
+interface TextTurnStreamStartEvent {
+  type: 'start';
+  user_message: StudioMessage;
+  assistant_message: StudioMessage;
+}
+
+interface TextTurnStreamDeltaEvent {
+  type: 'delta';
+  delta: string;
+  assistant_text?: string;
+}
+
+interface TextTurnStreamDoneEvent {
+  type: 'done';
+  user_message: StudioMessage;
+  assistant_message: StudioMessage;
+}
+
+interface TextTurnStreamErrorEvent {
+  type: 'error';
+  message: string;
+  assistant_message?: StudioMessage;
+}
+
+type TextTurnStreamEvent =
+  | TextTurnStreamStartEvent
+  | TextTurnStreamDeltaEvent
+  | TextTurnStreamDoneEvent
+  | TextTurnStreamErrorEvent;
+
+interface TextTurnStreamHandlers {
+  onStart?: (event: TextTurnStreamStartEvent) => void;
+  onDelta?: (event: TextTurnStreamDeltaEvent) => void;
+  onDone?: (event: TextTurnStreamDoneEvent) => void;
+  onError?: (event: TextTurnStreamErrorEvent) => void;
+}
+
+function parseStreamLine(line: string): TextTurnStreamEvent | null {
+  try {
+    const parsed = JSON.parse(line) as TextTurnStreamEvent;
+    if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export const studioApi = {
   getOptions(): Promise<StudioOptions> {
     return requestJson<StudioOptions>('/api/v1/options');
@@ -118,6 +169,13 @@ export const studioApi = {
   getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
     return requestJson<WorkspaceDetail>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}`);
   },
+  updateWorkspaceMode(workspaceId: string, mode: StudioComposerMode): Promise<WorkspaceDetail> {
+    return requestJson<WorkspaceDetail>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/mode`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+  },
   deleteWorkspace(workspaceId: string): Promise<{ status: string }> {
     return requestJson<{ status: string }>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
       method: 'DELETE',
@@ -160,6 +218,71 @@ export const studioApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
+  },
+  async createTextTurnStream(
+    workspaceId: string,
+    payload: CreateTurnPayload,
+    handlers: TextTurnStreamHandlers = {},
+  ): Promise<void> {
+    const response = await fetch(buildUrl(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/turns/text-stream`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      let message = `请求失败 (${response.status})`;
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown };
+        message = String(parsed.detail || message);
+      } catch {
+        message = text || message;
+      }
+      throw new Error(message);
+    }
+
+    if (!response.body) {
+      throw new Error('流式响应不可用');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const event = parseStreamLine(line);
+        if (!event) continue;
+        if (event.type === 'start') {
+          handlers.onStart?.(event);
+        } else if (event.type === 'delta') {
+          handlers.onDelta?.(event);
+        } else if (event.type === 'done') {
+          handlers.onDone?.(event);
+        } else if (event.type === 'error') {
+          handlers.onError?.(event);
+        }
+      }
+    }
+
+    const rest = buffer.trim();
+    if (rest) {
+      const event = parseStreamLine(rest);
+      if (event) {
+        if (event.type === 'start') handlers.onStart?.(event);
+        if (event.type === 'delta') handlers.onDelta?.(event);
+        if (event.type === 'done') handlers.onDone?.(event);
+        if (event.type === 'error') handlers.onError?.(event);
+      }
+    }
   },
   deleteImage(imageId: string): Promise<{ status: string }> {
     return requestJson<{ status: string }>(`/api/v1/images/${encodeURIComponent(imageId)}`, {

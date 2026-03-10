@@ -43,6 +43,7 @@ import type {
   ComposerReference,
   GenerationParams,
   MentionSettings,
+  StudioComposerMode,
   StudioAsset,
   StudioOptions,
 } from '../types/studio';
@@ -68,6 +69,7 @@ export interface OfficialFilters {
 interface ComposerDockProps {
   workspaceId?: string | null;
   text: string;
+  mode: StudioComposerMode;
   references: ComposerReference[];
   params: GenerationParams;
   options: StudioOptions | null;
@@ -91,10 +93,19 @@ interface ComposerDockProps {
   onTextChange: (value: string) => void;
   onReferencesChange: (references: ComposerReference[]) => void;
   onParamsChange: (patch: Partial<GenerationParams>) => void;
+  onModeChange: (mode: StudioComposerMode) => void;
+  textPromptPackEnabled: boolean;
+  onTextPromptPackEnabledChange: (enabled: boolean) => void;
   onUploadFiles: (files: File[]) => Promise<StudioAsset[]>;
   onConsumeInsertAssetRequest: () => void;
   onAnnotateReference: (reference: ComposerReference) => void;
   onSend: () => void;
+}
+
+interface TextTemplateItem {
+  id: string;
+  title: string;
+  content: string;
 }
 
 const PARAM_SELECT_BASE_SX = {
@@ -166,6 +177,10 @@ function sourceFromAsset(asset: StudioAsset): MentionAssetSource {
   return 'upload';
 }
 
+function sourceContentType(value: unknown): 'image' | 'text' {
+  return String(value || '').trim().toLowerCase() === 'text' ? 'text' : 'image';
+}
+
 function extractOrderedSlots(text: string): string[] {
   const matched = text.match(/@图[1-9]/g) || [];
   const seen = new Set<string>();
@@ -222,9 +237,16 @@ interface HighlightSegment {
   content: string;
   highlighted: boolean;
   objectToken?: boolean;
+  mentionThumbnailUrl?: string;
+  mentionTitle?: string;
 }
 
-function splitComposerTextByMentions(text: string, highlightedSlots: Set<string>): HighlightSegment[] {
+function splitComposerTextByMentions(
+  text: string,
+  highlightedSlots: Set<string>,
+  referenceBySlot: Map<string, ComposerReference>,
+  mentionAssetMap: Map<string, StudioAsset>,
+): HighlightSegment[] {
   if (!text) return [{ content: '', highlighted: false }];
   const segments: HighlightSegment[] = [];
   const regex = /@图[1-9]|【对象(?:[1-9])】/g;
@@ -237,7 +259,16 @@ function splitComposerTextByMentions(text: string, highlightedSlots: Set<string>
       segments.push({ content: text.slice(lastIndex, tokenStart), highlighted: false });
     }
     if (token.startsWith('@')) {
-      segments.push({ content: token, highlighted: highlightedSlots.has(token.slice(1)) });
+      const slot = token.slice(1);
+      const ref = referenceBySlot.get(slot);
+      const matchedAsset = ref ? mentionAssetMap.get(String(ref.asset_id || '')) : undefined;
+      const thumb = resolveAssetUrl(String(matchedAsset?.thumbnail_url || matchedAsset?.file_url || ''));
+      segments.push({
+        content: token,
+        highlighted: highlightedSlots.has(slot),
+        mentionThumbnailUrl: thumb || undefined,
+        mentionTitle: ref?.asset_title || matchedAsset?.title || ref?.asset_id || slot,
+      });
     } else {
       segments.push({ content: token, highlighted: true, objectToken: true });
     }
@@ -251,10 +282,14 @@ function splitComposerTextByMentions(text: string, highlightedSlots: Set<string>
 
 function MentionRefChip({
   refItem,
+  thumbnailUrl,
+  onPreview,
   onRemove,
   onAnnotate,
 }: {
   refItem: ComposerReference;
+  thumbnailUrl?: string;
+  onPreview?: (refItem: ComposerReference) => void;
   onRemove: (refItem: ComposerReference) => void;
   onAnnotate: (refItem: ComposerReference) => void;
 }) {
@@ -271,7 +306,32 @@ function MentionRefChip({
         border: 'none',
       }}
     >
-      <Typography variant="caption" sx={{ fontWeight: 600, color: '#ffffff' }}>
+      {thumbnailUrl ? (
+        <Box
+          component="button"
+          type="button"
+          onClick={() => onPreview?.(refItem)}
+          sx={{
+            width: 22,
+            height: 22,
+            borderRadius: 0.7,
+            border: '1px solid rgba(255,255,255,0.36)',
+            overflow: 'hidden',
+            p: 0,
+            cursor: 'pointer',
+            background: 'transparent',
+            flexShrink: 0,
+          }}
+        >
+          <Box
+            component="img"
+            src={thumbnailUrl}
+            alt={refItem.asset_title || refItem.asset_id}
+            sx={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+          />
+        </Box>
+      ) : null}
+      <Typography variant="caption" sx={{ fontWeight: 600, color: '#ffffff', ml: thumbnailUrl ? 0 : 0 }}>
         @{refItem.slot}
       </Typography>
       <Typography variant="caption" sx={{ fontWeight: 400, color: 'rgba(255,255,255,0.7)', maxWidth: 120 }} noWrap>
@@ -310,6 +370,7 @@ function MentionRefChip({
 export function ComposerDock({
   workspaceId = null,
   text,
+  mode,
   references,
   params,
   options,
@@ -333,6 +394,9 @@ export function ComposerDock({
   onTextChange,
   onReferencesChange,
   onParamsChange,
+  onModeChange,
+  textPromptPackEnabled,
+  onTextPromptPackEnabledChange,
   onUploadFiles,
   onConsumeInsertAssetRequest,
   onAnnotateReference,
@@ -342,7 +406,6 @@ export function ComposerDock({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const mentionUploadRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const [mode, setMode] = useState<'image' | 'text' | 'video'>('image');
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSource, setPickerSource] = useState<string>('upload');
@@ -357,6 +420,7 @@ export function ComposerDock({
   const [quickTemplateName, setQuickTemplateName] = useState('');
   const [quickTemplateContent, setQuickTemplateContent] = useState('');
   const [quickTemplateIsDefault, setQuickTemplateIsDefault] = useState(false);
+  const [mentionPreview, setMentionPreview] = useState<{ url: string; title: string } | null>(null);
   const handledInsertNonceRef = useRef<number>(0);
   const latestTextRef = useRef(text);
   const latestReferencesRef = useRef(references);
@@ -386,15 +450,15 @@ export function ComposerDock({
     ? sendDisabledReason || '当前内容暂不可发送'
     : '';
   const sendQueueHint = sending && !sendBlockedReason
-    ? '当前会话正在生成中，新消息会自动排队'
+    ? '当前会话正在生成中，可继续发送并发任务'
     : '';
 
   const sortedSources = useMemo(() => {
     const list = mentionSettings?.sources || [
-      { id: 'upload', name: '上传', enabled: true, order: 1, kind: 'dynamic', items: [] },
-      { id: 'generated', name: '生成', enabled: true, order: 2, kind: 'dynamic', items: [] },
-      { id: 'saved', name: '素材库', enabled: true, order: 3, kind: 'dynamic', items: [] },
-      { id: 'official', name: '官方', enabled: true, order: 4, kind: 'dynamic', items: [] },
+      { id: 'upload', name: '上传', enabled: true, order: 1, kind: 'dynamic', content_type: 'image', items: [] },
+      { id: 'generated', name: '生成', enabled: true, order: 2, kind: 'dynamic', content_type: 'image', items: [] },
+      { id: 'saved', name: '素材库', enabled: true, order: 3, kind: 'dynamic', content_type: 'image', items: [] },
+      { id: 'official', name: '官方', enabled: true, order: 4, kind: 'dynamic', content_type: 'image', items: [] },
     ];
     return [...list].sort((a, b) => a.order - b.order);
   }, [mentionSettings?.sources]);
@@ -430,6 +494,7 @@ export function ComposerDock({
     const map = new Map<string, StudioAsset[]>();
     sortedSources.forEach((source) => {
       if (source.kind !== 'static') return;
+      if (sourceContentType(source.content_type) !== 'image') return;
       const assets = dedupeById(
         (source.items || []).map((item) => ({
           id: item.id,
@@ -444,6 +509,26 @@ export function ComposerDock({
     });
     return map;
   }, [sortedSources]);
+  const staticTextTemplateMap = useMemo(() => {
+    const map = new Map<string, TextTemplateItem[]>();
+    sortedSources.forEach((source) => {
+      if (source.kind !== 'static') return;
+      if (sourceContentType(source.content_type) !== 'text') return;
+      const templates: TextTemplateItem[] = (source.items || [])
+        .map((item, index) => ({
+          id: String(item.id || `template-${source.id}-${index}`),
+          title: String(item.title || `模板${index + 1}`),
+          content: String(item.content || '').trim(),
+        }))
+        .filter((item) => Boolean(item.content));
+      map.set(source.id, templates);
+    });
+    return map;
+  }, [sortedSources]);
+  const staticCandidates = useMemo(
+    () => dedupeById(Array.from(staticCandidatesMap.values()).flat()),
+    [staticCandidatesMap],
+  );
 
   const officialCandidates = useMemo(() => {
     const q = mentionQuery.trim().toLowerCase();
@@ -482,11 +567,50 @@ export function ComposerDock({
     officialCandidates,
     staticCandidatesMap,
   ]);
+  const currentSource = useMemo(
+    () => enabledSources.find((source) => source.id === pickerSource) || null,
+    [enabledSources, pickerSource],
+  );
+  const isTextTemplateSource = Boolean(
+    currentSource && currentSource.kind === 'static' && sourceContentType(currentSource.content_type) === 'text',
+  );
+  const currentTextTemplates = useMemo(() => {
+    if (!isTextTemplateSource) return [];
+    const list = staticTextTemplateMap.get(pickerSource) || [];
+    const q = mentionQuery.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((item) => `${item.title} ${item.content}`.toLowerCase().includes(q));
+  }, [isTextTemplateSource, mentionQuery, pickerSource, staticTextTemplateMap]);
+  const mentionAssetMap = useMemo(() => {
+    const map = new Map<string, StudioAsset>();
+    const merged = dedupeById([
+      ...uploadCandidates,
+      ...generatedCandidates,
+      ...savedCandidates,
+      ...officialAssets,
+      ...staticCandidates,
+    ]);
+    merged.forEach((item) => {
+      const id = String(item.id || '').trim();
+      if (!id) return;
+      map.set(id, item);
+    });
+    return map;
+  }, [generatedCandidates, officialAssets, savedCandidates, staticCandidates, uploadCandidates]);
+  const referenceBySlot = useMemo(() => {
+    const map = new Map<string, ComposerReference>();
+    references.forEach((ref) => {
+      const slot = String(ref.slot || '').trim();
+      if (!slot) return;
+      map.set(slot, ref);
+    });
+    return map;
+  }, [references]);
 
   const highlightedSlots = useMemo(() => new Set(references.map((ref) => ref.slot)), [references]);
   const composerHighlightSegments = useMemo(
-    () => splitComposerTextByMentions(text, highlightedSlots),
-    [highlightedSlots, text],
+    () => splitComposerTextByMentions(text, highlightedSlots, referenceBySlot, mentionAssetMap),
+    [highlightedSlots, mentionAssetMap, referenceBySlot, text],
   );
 
   const closePicker = useCallback(() => {
@@ -560,6 +684,36 @@ export function ComposerDock({
       }, 0);
     },
     [closePicker, mentionStart, onReferencesChange, onTextChange, references, text],
+  );
+
+  const insertTextTemplate = useCallback(
+    (templateContent: string, replaceMention = true) => {
+      const normalized = String(templateContent || '').trim();
+      if (!normalized) {
+        setPickerError('模板内容为空，无法插入');
+        return;
+      }
+      const textarea = textareaRef.current;
+      const caret = textarea?.selectionStart ?? text.length;
+      const start = replaceMention && mentionStart >= 0 ? mentionStart : caret;
+      const left = text.slice(0, start);
+      const right = text.slice(caret);
+      const needsPrefixNewline = left.trim().length > 0 && !/[\s\n]$/.test(left);
+      const needsSuffixNewline = right.trim().length > 0 && !/^[\s\n]/.test(right);
+      const inserted = `${needsPrefixNewline ? '\n' : ''}${normalized}${needsSuffixNewline ? '\n' : ''}`;
+      const nextText = `${left}${inserted}${right}`;
+
+      onTextChange(nextText);
+      closePicker();
+      window.setTimeout(() => {
+        const target = textareaRef.current;
+        if (!target) return;
+        const cursor = left.length + inserted.length;
+        target.focus();
+        target.setSelectionRange(cursor, cursor);
+      }, 0);
+    },
+    [closePicker, mentionStart, onTextChange, text],
   );
 
   const appendUploadedAssetsToComposer = useCallback((assets: StudioAsset[]) => {
@@ -639,6 +793,19 @@ export function ComposerDock({
     onTextChange(nextText);
     onReferencesChange(references.filter((item) => item.mention_id !== refItem.mention_id));
   }
+
+  const handlePreviewReference = useCallback(
+    (refItem: ComposerReference) => {
+      const asset = mentionAssetMap.get(String(refItem.asset_id || '').trim());
+      const url = resolveAssetUrl(String(asset?.file_url || asset?.thumbnail_url || ''));
+      if (!url) return;
+      setMentionPreview({
+        url,
+        title: refItem.asset_title || asset?.title || `@${refItem.slot}`,
+      });
+    },
+    [mentionAssetMap],
+  );
 
   async function handleMentionUpload(files: File[], options?: { autoInsertToComposer?: boolean }) {
     const imageFiles = collectImageFiles(files);
@@ -808,17 +975,19 @@ export function ComposerDock({
                 void handleMentionUpload(files);
               }}
             />
-            <IconButton
-              size="small"
-              onClick={() => mentionUploadRef.current?.click()}
-              disabled={pickerUploading}
-              sx={{
-                border: '1px solid rgba(0,0,0,0.08)',
-                bgcolor: 'rgba(0,0,0,0.03)',
-              }}
-            >
-              {pickerUploading ? <CircularProgress size={16} /> : <AttachFileRoundedIcon sx={{ fontSize: 18 }} />}
-            </IconButton>
+            {!isTextTemplateSource ? (
+              <IconButton
+                size="small"
+                onClick={() => mentionUploadRef.current?.click()}
+                disabled={pickerUploading}
+                sx={{
+                  border: '1px solid rgba(0,0,0,0.08)',
+                  bgcolor: 'rgba(0,0,0,0.03)',
+                }}
+              >
+                {pickerUploading ? <CircularProgress size={16} /> : <AttachFileRoundedIcon sx={{ fontSize: 18 }} />}
+              </IconButton>
+            ) : null}
             <IconButton
               size="small"
               onClick={closePicker}
@@ -860,7 +1029,7 @@ export function ComposerDock({
             p: 1,
           }}
         >
-          {pickerSource === 'upload' ? (
+          {pickerSource === 'upload' && !isTextTemplateSource ? (
             <Button
               fullWidth
               variant="outlined"
@@ -919,7 +1088,47 @@ export function ComposerDock({
             </>
           ) : null}
 
-          {currentCandidates.length > 0 ? (
+          {isTextTemplateSource ? (
+            currentTextTemplates.length > 0 ? (
+              <Stack spacing={0.8}>
+                {currentTextTemplates.map((item) => (
+                  <Box
+                    key={item.id}
+                    onClick={() => insertTextTemplate(item.content, true)}
+                    sx={{
+                      p: 1,
+                      borderRadius: 0.7,
+                      border: '1px solid rgba(0,0,0,0.08)',
+                      bgcolor: '#ffffff',
+                      cursor: 'pointer',
+                      '&:hover': {
+                        borderColor: 'rgba(0,0,0,0.14)',
+                        bgcolor: 'rgba(0,0,0,0.015)',
+                      },
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ display: 'block', fontWeight: 700, color: '#2a2a2a' }}>
+                      {item.title}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      sx={{ display: 'block', color: '#5d6572', mt: 0.35, whiteSpace: 'pre-wrap' }}
+                    >
+                      {item.content}
+                    </Typography>
+                  </Box>
+                ))}
+              </Stack>
+            ) : (
+              <Stack alignItems="center" justifyContent="center" sx={{ minHeight: 230, color: '#6b7280' }} spacing={0.8}>
+                <AutoAwesomeRoundedIcon />
+                <Typography variant="body2" fontWeight={700}>
+                  当前来源暂无文字模板
+                </Typography>
+                <Typography variant="caption">在设置里新增文字条目后，这里可直接一键插入</Typography>
+              </Stack>
+            )
+          ) : currentCandidates.length > 0 ? (
             <Box
               sx={{
                 display: 'grid',
@@ -1128,19 +1337,59 @@ export function ComposerDock({
               }}
             >
               {composerHighlightSegments.map((segment, idx) => (
-                <Box
-                  key={`${segment.content}-${idx}`}
-                  component="span"
-                  sx={segment.highlighted ? {
-                    bgcolor: segment.objectToken ? 'rgba(123, 165, 120, 0.24)' : 'rgba(195, 132, 76, 0.26)',
-                    color: segment.objectToken ? '#2f5f34' : '#6d4423',
-                    borderRadius: 0.8,
-                    boxDecorationBreak: 'clone',
-                    WebkitBoxDecorationBreak: 'clone',
-                  } : undefined}
-                >
-                  {segment.content}
-                </Box>
+                segment.mentionThumbnailUrl ? (
+                  <Box
+                    key={`${segment.content}-${idx}`}
+                    component="span"
+                    sx={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 0.45,
+                      px: 0.45,
+                      py: 0.1,
+                      mr: 0.25,
+                      borderRadius: 0.8,
+                      bgcolor: segment.highlighted ? 'rgba(195, 132, 76, 0.18)' : 'rgba(62, 100, 168, 0.12)',
+                      border: segment.highlighted ? '1px solid rgba(195, 132, 76, 0.36)' : '1px solid rgba(62, 100, 168, 0.24)',
+                      color: '#2e4f7e',
+                      verticalAlign: 'middle',
+                      boxDecorationBreak: 'clone',
+                      WebkitBoxDecorationBreak: 'clone',
+                    }}
+                  >
+                    <Box
+                      component="img"
+                      src={segment.mentionThumbnailUrl}
+                      alt={segment.mentionTitle || segment.content}
+                      sx={{
+                        width: 17,
+                        height: 17,
+                        borderRadius: 0.5,
+                        objectFit: 'cover',
+                        display: 'block',
+                        border: '1px solid rgba(87, 122, 186, 0.3)',
+                        flexShrink: 0,
+                      }}
+                    />
+                    <Box component="span" sx={{ fontWeight: 600 }}>
+                      {segment.content}
+                    </Box>
+                  </Box>
+                ) : (
+                  <Box
+                    key={`${segment.content}-${idx}`}
+                    component="span"
+                    sx={segment.highlighted ? {
+                      bgcolor: segment.objectToken ? 'rgba(123, 165, 120, 0.24)' : 'rgba(195, 132, 76, 0.26)',
+                      color: segment.objectToken ? '#2f5f34' : '#6d4423',
+                      borderRadius: 0.8,
+                      boxDecorationBreak: 'clone',
+                      WebkitBoxDecorationBreak: 'clone',
+                    } : undefined}
+                  >
+                    {segment.content}
+                  </Box>
+                )
               ))}
               {text.length === 0 ? <Box component="span" sx={{ color: '#8f857a' }}>{mentionComposerPlaceholder}</Box> : null}
             </Box>
@@ -1161,6 +1410,14 @@ export function ComposerDock({
                 openPickerFromText(event.currentTarget.value, event.currentTarget.selectionStart ?? event.currentTarget.value.length)
               }
               onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  if (event.nativeEvent.isComposing) return;
+                  event.preventDefault();
+                  if (!sendDisabled) {
+                    onSend();
+                  }
+                  return;
+                }
                 if (event.key === 'Escape') closePicker();
               }}
               onPaste={(event) => {
@@ -1214,14 +1471,20 @@ export function ComposerDock({
           ) : null}
 
           <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mt: 0.6 }}>
-            {references.map((refItem) => (
-              <MentionRefChip
-                key={refItem.mention_id}
-                refItem={refItem}
-                onRemove={handleRemoveReference}
-                onAnnotate={(item) => onAnnotateReference(item)}
-              />
-            ))}
+            {references.map((refItem) => {
+              const matchedAsset = mentionAssetMap.get(String(refItem.asset_id || '').trim());
+              const thumb = resolveAssetUrl(String(matchedAsset?.thumbnail_url || matchedAsset?.file_url || ''));
+              return (
+                <MentionRefChip
+                  key={refItem.mention_id}
+                  refItem={refItem}
+                  thumbnailUrl={thumb || undefined}
+                  onPreview={handlePreviewReference}
+                  onRemove={handleRemoveReference}
+                  onAnnotate={(item) => onAnnotateReference(item)}
+                />
+              );
+            })}
           </Stack>
         </Box>
 
@@ -1234,7 +1497,9 @@ export function ComposerDock({
                 exclusive
                 value={mode}
                 onChange={(_event, value) => {
-                  if (value) setMode(value);
+                  if (value === 'image' || value === 'text') {
+                    onModeChange(value);
+                  }
                 }}
                 sx={{
                   '& .MuiToggleButton-root': {
@@ -1260,24 +1525,50 @@ export function ComposerDock({
                     <span>Image</span>
                   </Stack>
                 </ToggleButton>
+                <ToggleButton value="text">
+                  <Stack direction="row" spacing={0.4} alignItems="center">
+                    <AutoAwesomeRoundedIcon sx={{ fontSize: 14 }} />
+                    <span>Text</span>
+                  </Stack>
+                </ToggleButton>
               </ToggleButtonGroup>
             </Stack>
             <Box sx={{ flex: 1 }} />
 
             <Stack direction="row" spacing={0.7} useFlexGap flexWrap="wrap" justifyContent="flex-end">
-              <Box
-                component="select"
-                value={params.model}
-                onChange={(event) => onParamsChange({ model: event.target.value })}
-                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: '100%', sm: 126 } }}
-                aria-label="模型"
-              >
-                {modelOptions.map((item) => (
-                  <option key={String(item.value)} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </Box>
+              {mode === 'image' ? (
+                <Box
+                  component="select"
+                  value={params.model}
+                  onChange={(event) => onParamsChange({ model: event.target.value })}
+                  sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: '100%', sm: 126 } }}
+                  aria-label="模型"
+                >
+                  {modelOptions.map((item) => (
+                    <option key={String(item.value)} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </Box>
+              ) : null}
+              {mode === 'text' ? (
+                <Button
+                  size="small"
+                  onClick={() => onTextPromptPackEnabledChange(!textPromptPackEnabled)}
+                  sx={{
+                    height: 30,
+                    minWidth: 88,
+                    borderRadius: 1.6,
+                    border: '1px solid rgba(129, 102, 77, 0.22)',
+                    bgcolor: textPromptPackEnabled ? 'rgba(138, 91, 53, 0.16)' : '#ede6de',
+                    color: textPromptPackEnabled ? '#6a4528' : '#72553c',
+                    fontWeight: 700,
+                    px: 1.1,
+                  }}
+                >
+                  5条生图词
+                </Button>
+              ) : null}
               <IconButton
                 size="small"
                 onClick={() => inputRef.current?.click()}
@@ -1292,45 +1583,49 @@ export function ComposerDock({
               >
                 <ImageRoundedIcon sx={{ fontSize: 16 }} />
               </IconButton>
-              <Box
-                component="select"
-                value={params.aspect_ratio}
-                onChange={(event) => onParamsChange({ aspect_ratio: event.target.value })}
-                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 74 } }}
-                aria-label="比例"
-              >
-                {ratioOptions.map((item) => (
-                  <option key={String(item.value)} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </Box>
-              <Box
-                component="select"
-                value={params.quality}
-                onChange={(event) => onParamsChange({ quality: event.target.value })}
-                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 70 } }}
-                aria-label="清晰度"
-              >
-                {qualityOptions.map((item) => (
-                  <option key={String(item.value)} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </Box>
-              <Box
-                component="select"
-                value={params.count}
-                onChange={(event) => onParamsChange({ count: Number(event.target.value) })}
-                sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 84 } }}
-                aria-label="同时生成"
-              >
-                {countOptions.map((item) => (
-                  <option key={String(item.value)} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </Box>
+              {mode === 'image' ? (
+                <>
+                  <Box
+                    component="select"
+                    value={params.aspect_ratio}
+                    onChange={(event) => onParamsChange({ aspect_ratio: event.target.value })}
+                    sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 74 } }}
+                    aria-label="比例"
+                  >
+                    {ratioOptions.map((item) => (
+                      <option key={String(item.value)} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </Box>
+                  <Box
+                    component="select"
+                    value={params.quality}
+                    onChange={(event) => onParamsChange({ quality: event.target.value })}
+                    sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 70 } }}
+                    aria-label="清晰度"
+                  >
+                    {qualityOptions.map((item) => (
+                      <option key={String(item.value)} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </Box>
+                  <Box
+                    component="select"
+                    value={params.count}
+                    onChange={(event) => onParamsChange({ count: Number(event.target.value) })}
+                    sx={{ ...PARAM_SELECT_BASE_SX, width: { xs: 'calc(50% - 4px)', sm: 84 } }}
+                    aria-label="同时生成"
+                  >
+                    {countOptions.map((item) => (
+                      <option key={String(item.value)} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </Box>
+                </>
+              ) : null}
               <Button
                 variant="contained"
                 disabled={sendDisabled}
@@ -1357,6 +1652,10 @@ export function ComposerDock({
             <Typography variant="caption" sx={{ color: '#7a6b5d', fontWeight: 600 }}>
               {sendQueueHint}
             </Typography>
+          ) : mode === 'text' && textPromptPackEnabled ? (
+            <Typography variant="caption" sx={{ color: '#7a6b5d', fontWeight: 600 }}>
+              已开启 5 条生图提示词结构化输出
+            </Typography>
           ) : null}
         </Stack>
 
@@ -1374,6 +1673,35 @@ export function ComposerDock({
           }}
         />
       </Box>
+
+      <Dialog
+        open={Boolean(mentionPreview)}
+        onClose={() => setMentionPreview(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>{mentionPreview?.title || '素材预览'}</DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          {mentionPreview?.url ? (
+            <Box
+              component="img"
+              src={mentionPreview.url}
+              alt={mentionPreview.title || 'mention-preview'}
+              sx={{
+                width: '100%',
+                maxHeight: '70vh',
+                objectFit: 'contain',
+                borderRadius: 1,
+                border: '1px solid #e5eaf2',
+                bgcolor: '#f7f9fc',
+              }}
+            />
+          ) : null}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setMentionPreview(null)}>关闭</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog
         open={quickTemplateDialogOpen}

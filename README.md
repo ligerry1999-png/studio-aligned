@@ -18,6 +18,27 @@
 - 启动前端（`5174`）
 - 自动打开浏览器
 
+## 画布调试启动（含日志）
+
+如果你主要在测“画布模式 + 工作流”，建议双击：
+
+`start_workflow_canvas_debug.command`
+
+它会自动：
+- 打开画布页：`http://127.0.0.1:5174/workflow`
+- 把后端和前端日志写入项目目录 `.logs/`
+- 同步生成 `latest-backend.log` / `latest-frontend.log` 软链，便于持续排错
+
+测试过程中可双击：
+
+`watch_workflow_logs.command`
+
+实时看日志；也可双击：
+
+`diagnose_workflow_logs.command`
+
+快速筛出 error/exception 线索，便于定位问题。
+
 ## 1) 启动后端
 
 ```bash

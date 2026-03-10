@@ -27,6 +27,7 @@ import { resolveAssetUrl } from '../api/client';
 
 import type {
   MentionSettings,
+  MentionSourceContentType,
   MentionSourceConfig,
   MentionSourceItem,
   RuntimeConfig,
@@ -60,6 +61,9 @@ const DEFAULT_API_CONFIG: RuntimeConfig = {
     endpoint: '',
     api_key: '',
     api_key_managed_by_env: false,
+    text_api_key: '',
+    text_api_key_managed_by_env: false,
+    text_model: 'gpt-4.1-mini',
     response_format: 'url',
     timeout_seconds: 120,
     download_dir: '',
@@ -71,10 +75,10 @@ const DEFAULT_MENTION_SETTINGS: MentionSettings = {
   search_placeholder: '搜索素材标题...',
   upload_button_text: '点击 / 拖拽 / 粘贴 上传',
   sources: [
-    { id: 'upload', name: '上传', enabled: true, order: 1, kind: 'dynamic', items: [] },
-    { id: 'generated', name: '生成', enabled: true, order: 2, kind: 'dynamic', items: [] },
-    { id: 'saved', name: '素材库', enabled: true, order: 3, kind: 'dynamic', items: [] },
-    { id: 'official', name: '官方', enabled: true, order: 4, kind: 'dynamic', items: [] },
+    { id: 'upload', name: '上传', enabled: true, order: 1, kind: 'dynamic', content_type: 'image', items: [] },
+    { id: 'generated', name: '生成', enabled: true, order: 2, kind: 'dynamic', content_type: 'image', items: [] },
+    { id: 'saved', name: '素材库', enabled: true, order: 3, kind: 'dynamic', content_type: 'image', items: [] },
+    { id: 'official', name: '官方', enabled: true, order: 4, kind: 'dynamic', content_type: 'image', items: [] },
   ],
   official_prompts: [],
   official_taxonomies: {
@@ -86,6 +90,10 @@ const DEFAULT_MENTION_SETTINGS: MentionSettings = {
 };
 const PROTECTED_MENTION_SOURCE_IDS = new Set(['upload', 'generated', 'saved']);
 
+function normalizeSourceContentType(value: unknown): MentionSourceContentType {
+  return String(value || '').trim().toLowerCase() === 'text' ? 'text' : 'image';
+}
+
 function normalizeRuntime(input: RuntimeConfig): RuntimeConfig {
   const timeout = Number.isFinite(input.http.timeout_seconds) ? Number(input.http.timeout_seconds) : 120;
   return {
@@ -93,6 +101,9 @@ function normalizeRuntime(input: RuntimeConfig): RuntimeConfig {
       endpoint: input.http.endpoint.trim(),
       api_key: input.http.api_key || '',
       api_key_managed_by_env: Boolean(input.http.api_key_managed_by_env),
+      text_api_key: input.http.text_api_key || '',
+      text_api_key_managed_by_env: Boolean(input.http.text_api_key_managed_by_env),
+      text_model: String(input.http.text_model || 'gpt-4.1-mini').trim() || 'gpt-4.1-mini',
       response_format: input.http.response_format === 'b64_json' ? 'b64_json' : 'url',
       timeout_seconds: Math.max(5, Math.min(Math.round(timeout), 600)),
       download_dir: String(input.http.download_dir || '').trim(),
@@ -104,11 +115,22 @@ function resequenceSources(sources: MentionSourceConfig[]): MentionSourceConfig[
   const sorted = [...sources].sort((a, b) => a.order - b.order);
   return sorted.map((source, index) => ({
     ...source,
+    content_type: source.kind === 'static' ? normalizeSourceContentType(source.content_type) : 'image',
     order: index + 1,
     items: source.kind === 'static'
       ? [...(source.items || [])]
           .sort((a, b) => a.order - b.order)
-          .map((item, itemIndex) => ({ ...item, order: itemIndex + 1 }))
+          .map((item, itemIndex) => ({
+            ...item,
+            order: itemIndex + 1,
+            item_type: normalizeSourceContentType(source.content_type),
+            storage_key: normalizeSourceContentType(source.content_type) === 'image'
+              ? String(item.storage_key || '').trim()
+              : '',
+            content: normalizeSourceContentType(source.content_type) === 'text'
+              ? String(item.content || '').trim()
+              : '',
+          }))
       : [],
   }));
 }
@@ -120,6 +142,9 @@ function normalizeMention(input: MentionSettings): MentionSettings {
         .filter((source) => source && source.id)
         .map((source, index): MentionSourceConfig => {
           const kind: MentionSourceConfig['kind'] = source.kind === 'static' ? 'static' : 'dynamic';
+          const contentType: MentionSourceContentType = kind === 'static'
+            ? normalizeSourceContentType(source.content_type)
+            : 'image';
           return {
             ...source,
             id: String(source.id).trim(),
@@ -127,6 +152,7 @@ function normalizeMention(input: MentionSettings): MentionSettings {
             enabled: Boolean(source.enabled),
             order: Number.isFinite(source.order) ? Number(source.order) : index + 1,
             kind,
+            content_type: contentType,
             items:
               kind === 'static' && Array.isArray(source.items)
                 ? source.items
@@ -134,12 +160,17 @@ function normalizeMention(input: MentionSettings): MentionSettings {
                     .map((item, itemIndex) => ({
                       ...item,
                       id: String(item.id).trim(),
-                      title: String(item.title || item.id || `素材${itemIndex + 1}`).trim() || `素材${itemIndex + 1}`,
+                      item_type: contentType,
+                      title:
+                        String(
+                          item.title || item.id || (contentType === 'text' ? `文本${itemIndex + 1}` : `素材${itemIndex + 1}`),
+                        ).trim() || (contentType === 'text' ? `文本${itemIndex + 1}` : `素材${itemIndex + 1}`),
                       order: Number.isFinite(item.order) ? Number(item.order) : itemIndex + 1,
                       tags: Array.isArray(item.tags)
                         ? item.tags.map((tag) => String(tag || '').trim()).filter(Boolean)
                         : [],
-                      storage_key: String(item.storage_key || '').trim(),
+                      content: contentType === 'text' ? String(item.content || '').trim() : '',
+                      storage_key: contentType === 'image' ? String(item.storage_key || '').trim() : '',
                     }))
                 : [],
           };
@@ -250,6 +281,7 @@ export function ApiSettingsDialog({
     });
   }, [activeSourceId, dynamicSourceAssets.generated, dynamicSourceAssets.saved, dynamicSourceAssets.upload, dynamicSourceQuery]);
   const apiKeyManagedByEnv = Boolean(apiDraft.http.api_key_managed_by_env);
+  const textApiKeyManagedByEnv = Boolean(apiDraft.http.text_api_key_managed_by_env);
 
   function resetDrafts() {
     const nextMention = normalizeMention(mentionSettings || DEFAULT_MENTION_SETTINGS);
@@ -276,6 +308,9 @@ export function ApiSettingsDialog({
     const normalized = normalizeRuntime(apiDraft);
     if (normalized.http.api_key_managed_by_env) {
       normalized.http.api_key = '';
+    }
+    if (normalized.http.text_api_key_managed_by_env) {
+      normalized.http.text_api_key = '';
     }
     if (!normalized.http.endpoint) {
       setApiError('请填写小豆包 API 地址。');
@@ -319,7 +354,22 @@ export function ApiSettingsDialog({
 
   function patchSource(sourceId: string, patch: Partial<MentionSourceConfig>) {
     setMentionDraft((prev) => {
-      const next = prev.sources.map((source) => (source.id === sourceId ? { ...source, ...patch } : source));
+      const next: MentionSourceConfig[] = prev.sources.map((source): MentionSourceConfig => {
+        if (source.id !== sourceId) return source;
+        const merged = { ...source, ...patch };
+        if (merged.kind === 'dynamic') {
+          return { ...merged, content_type: 'image', items: [] as MentionSourceItem[] };
+        }
+        const contentType = normalizeSourceContentType(merged.content_type);
+        const normalizedItems = contentType === normalizeSourceContentType(source.content_type)
+          ? source.items
+          : ([] as MentionSourceItem[]);
+        return {
+          ...merged,
+          content_type: contentType,
+          items: normalizedItems,
+        };
+      });
       return { ...prev, sources: resequenceSources(next) };
     });
   }
@@ -357,6 +407,7 @@ export function ApiSettingsDialog({
         enabled: true,
         order: nextIndex,
         kind: 'static',
+        content_type: 'image',
         items: [],
       };
       return {
@@ -472,8 +523,54 @@ export function ApiSettingsDialog({
     }));
   }
 
+  function patchStaticItemContent(sourceId: string, itemId: string, content: string) {
+    setMentionDraft((prev) => ({
+      ...prev,
+      sources: resequenceSources(
+        prev.sources.map((source) => {
+          if (source.id !== sourceId || source.kind !== 'static') return source;
+          return {
+            ...source,
+            items: source.items.map((item) => (item.id === itemId ? { ...item, content } : item)),
+          };
+        }),
+      ),
+    }));
+  }
+
+  function addStaticTextItem(sourceId: string) {
+    setMentionDraft((prev) => ({
+      ...prev,
+      sources: resequenceSources(
+        prev.sources.map((source) => {
+          if (source.id !== sourceId || source.kind !== 'static') return source;
+          const textIndex = source.items.length + 1;
+          const item: MentionSourceItem = {
+            id: `static-text-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+            title: `文本${textIndex}`,
+            order: textIndex,
+            tags: [],
+            item_type: 'text',
+            content: '',
+            storage_key: '',
+          };
+          return {
+            ...source,
+            content_type: 'text',
+            items: source.items.concat(item),
+          };
+        }),
+      ),
+    }));
+  }
+
   async function handleUploadItems(sourceId: string, files: File[]) {
     if (files.length === 0) return;
+    const currentSource = sortedSources.find((source) => source.id === sourceId);
+    if (!currentSource || currentSource.kind !== 'static' || normalizeSourceContentType(currentSource.content_type) !== 'image') {
+      setMentionError('仅图片类型静态来源支持上传素材');
+      return;
+    }
     setUploadingSourceId(sourceId);
     try {
       const uploadedItems: MentionSourceItem[] = [];
@@ -491,6 +588,8 @@ export function ApiSettingsDialog({
                 ...item,
                 order: source.items.length + index + 1,
                 tags: item.tags || [],
+                item_type: 'image',
+                content: '',
               })),
             );
             return {
@@ -599,10 +698,10 @@ export function ApiSettingsDialog({
             />
 
             {apiKeyManagedByEnv ? (
-              <Alert severity="info">API Key 已由服务器环境变量托管，前端设置中已隐藏。</Alert>
+              <Alert severity="info">图像 API Key 已由服务器环境变量托管，前端设置中已隐藏。</Alert>
             ) : (
               <TextField
-                label="API Key"
+                label="图像 API Key"
                 type="password"
                 value={apiDraft.http.api_key}
                 onChange={(event) =>
@@ -615,6 +714,37 @@ export function ApiSettingsDialog({
                 fullWidth
               />
             )}
+
+            {textApiKeyManagedByEnv ? (
+              <Alert severity="info">Text API Key 已由服务器环境变量托管，前端设置中已隐藏。</Alert>
+            ) : (
+              <TextField
+                label="Text API Key（可选）"
+                type="password"
+                value={apiDraft.http.text_api_key}
+                onChange={(event) =>
+                  setApiDraft((prev) => ({
+                    ...prev,
+                    http: { ...prev.http, text_api_key: event.target.value },
+                  }))
+                }
+                size="small"
+                fullWidth
+              />
+            )}
+
+            <TextField
+              label="Text 模型"
+              value={apiDraft.http.text_model}
+              onChange={(event) =>
+                setApiDraft((prev) => ({
+                  ...prev,
+                  http: { ...prev.http, text_model: event.target.value },
+                }))
+              }
+              size="small"
+              fullWidth
+            />
 
             <TextField
               select
@@ -715,6 +845,7 @@ export function ApiSettingsDialog({
                   const isActive = activeSourceId === source.id;
                   const isDynamicManageable = source.kind === 'dynamic' && ['upload', 'generated', 'saved'].includes(source.id);
                   const isProtectedSource = PROTECTED_MENTION_SOURCE_IDS.has(source.id);
+                  const staticContentType = source.kind === 'static' ? normalizeSourceContentType(source.content_type) : 'image';
                   return (
                     <Box
                       key={source.id}
@@ -744,6 +875,20 @@ export function ApiSettingsDialog({
                           sx={{ minWidth: 180 }}
                         />
                         <Chip label={source.kind === 'static' ? '静态来源' : '动态来源'} size="small" />
+                        {source.kind === 'static' ? (
+                          <TextField
+                            select
+                            size="small"
+                            value={staticContentType}
+                            onChange={(event) =>
+                              patchSource(source.id, { content_type: normalizeSourceContentType(event.target.value) })
+                            }
+                            sx={{ width: 120 }}
+                          >
+                            <MenuItem value="image">图片条目</MenuItem>
+                            <MenuItem value="text">文字条目</MenuItem>
+                          </TextField>
+                        ) : null}
                         <Typography variant="caption" color="text.secondary">
                           顺序 {source.order}
                         </Typography>
@@ -870,66 +1015,140 @@ export function ApiSettingsDialog({
                           </Box>
                         ) : (
                           <Box sx={{ mt: 1 }}>
-                            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 0.8 }}>
-                              <Typography variant="caption" color="text.secondary">
-                                静态条目（可上传、排序、删除）
-                              </Typography>
-                              <Button
-                                size="small"
-                                startIcon={<UploadFileRoundedIcon />}
-                                disabled={mentionSaving || Boolean(uploadingSourceId)}
-                                onClick={() => {
-                                  pendingUploadSourceIdRef.current = source.id;
-                                  fileInputRef.current?.click();
-                                }}
-                              >
-                                {uploadingSourceId === source.id ? '上传中...' : '添加素材'}
-                              </Button>
-                            </Stack>
-                            <Stack spacing={0.8}>
-                              {(source.items || []).map((item, itemIndex) => (
-                                <Stack
-                                  key={item.id}
-                                  direction="row"
-                                  spacing={1}
-                                  alignItems="center"
-                                  sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 0.7 }}
-                                >
-                                  <Box
-                                    component="img"
-                                    src={resolveAssetUrl(item.thumbnail_url || item.file_url)}
-                                    alt={item.title}
-                                    sx={{ width: 42, height: 42, borderRadius: 0.8, objectFit: 'cover', bgcolor: 'action.hover' }}
-                                  />
-                                  <TextField
-                                    size="small"
-                                    value={item.title}
-                                    onChange={(event) => patchStaticItemTitle(source.id, item.id, event.target.value)}
-                                    sx={{ flex: 1 }}
-                                  />
+                            {staticContentType === 'text' ? (
+                              <>
+                                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 0.8 }}>
                                   <Typography variant="caption" color="text.secondary">
-                                    {item.order}
+                                    文字条目（可编辑、排序、删除）
                                   </Typography>
-                                  <IconButton
+                                  <Button
                                     size="small"
-                                    onClick={() => moveStaticItem(source.id, item.id, -1)}
-                                    disabled={itemIndex === 0}
+                                    startIcon={<AddRoundedIcon />}
+                                    disabled={mentionSaving}
+                                    onClick={() => addStaticTextItem(source.id)}
                                   >
-                                    <ArrowUpwardRoundedIcon fontSize="small" />
-                                  </IconButton>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => moveStaticItem(source.id, item.id, 1)}
-                                    disabled={itemIndex === source.items.length - 1}
-                                  >
-                                    <ArrowDownwardRoundedIcon fontSize="small" />
-                                  </IconButton>
-                                  <IconButton size="small" color="error" onClick={() => deleteStaticItem(source.id, item.id)}>
-                                    <DeleteOutlineRoundedIcon fontSize="small" />
-                                  </IconButton>
+                                    新增条目
+                                  </Button>
                                 </Stack>
-                              ))}
-                            </Stack>
+                                <Stack spacing={0.8}>
+                                  {(source.items || []).map((item, itemIndex) => (
+                                    <Stack
+                                      key={item.id}
+                                      spacing={0.7}
+                                      sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 0.8 }}
+                                    >
+                                      <Stack direction="row" spacing={0.8} alignItems="center">
+                                        <TextField
+                                          size="small"
+                                          label="标题"
+                                          value={item.title}
+                                          onChange={(event) => patchStaticItemTitle(source.id, item.id, event.target.value)}
+                                          sx={{ flex: 1 }}
+                                        />
+                                        <Typography variant="caption" color="text.secondary">
+                                          {item.order}
+                                        </Typography>
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => moveStaticItem(source.id, item.id, -1)}
+                                          disabled={itemIndex === 0}
+                                        >
+                                          <ArrowUpwardRoundedIcon fontSize="small" />
+                                        </IconButton>
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => moveStaticItem(source.id, item.id, 1)}
+                                          disabled={itemIndex === source.items.length - 1}
+                                        >
+                                          <ArrowDownwardRoundedIcon fontSize="small" />
+                                        </IconButton>
+                                        <IconButton size="small" color="error" onClick={() => deleteStaticItem(source.id, item.id)}>
+                                          <DeleteOutlineRoundedIcon fontSize="small" />
+                                        </IconButton>
+                                      </Stack>
+                                      <TextField
+                                        size="small"
+                                        label="内容"
+                                        value={String(item.content || '')}
+                                        onChange={(event) => patchStaticItemContent(source.id, item.id, event.target.value)}
+                                        multiline
+                                        minRows={2}
+                                        fullWidth
+                                      />
+                                    </Stack>
+                                  ))}
+                                </Stack>
+                              </>
+                            ) : (
+                              <>
+                                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 0.8 }}>
+                                  <Typography variant="caption" color="text.secondary">
+                                    图片条目（可上传、排序、删除）
+                                  </Typography>
+                                  <Button
+                                    size="small"
+                                    startIcon={<UploadFileRoundedIcon />}
+                                    disabled={mentionSaving || Boolean(uploadingSourceId)}
+                                    onClick={() => {
+                                      pendingUploadSourceIdRef.current = source.id;
+                                      fileInputRef.current?.click();
+                                    }}
+                                  >
+                                    {uploadingSourceId === source.id ? '上传中...' : '添加素材'}
+                                  </Button>
+                                </Stack>
+                                <Stack spacing={0.8}>
+                                  {(source.items || []).map((item, itemIndex) => (
+                                    <Stack
+                                      key={item.id}
+                                      direction="row"
+                                      spacing={1}
+                                      alignItems="center"
+                                      sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 0.7 }}
+                                    >
+                                      <Box
+                                        component="img"
+                                        src={resolveAssetUrl(item.thumbnail_url || item.file_url)}
+                                        alt={item.title}
+                                        sx={{
+                                          width: 42,
+                                          height: 42,
+                                          borderRadius: 0.8,
+                                          objectFit: 'cover',
+                                          bgcolor: 'action.hover',
+                                        }}
+                                      />
+                                      <TextField
+                                        size="small"
+                                        value={item.title}
+                                        onChange={(event) => patchStaticItemTitle(source.id, item.id, event.target.value)}
+                                        sx={{ flex: 1 }}
+                                      />
+                                      <Typography variant="caption" color="text.secondary">
+                                        {item.order}
+                                      </Typography>
+                                      <IconButton
+                                        size="small"
+                                        onClick={() => moveStaticItem(source.id, item.id, -1)}
+                                        disabled={itemIndex === 0}
+                                      >
+                                        <ArrowUpwardRoundedIcon fontSize="small" />
+                                      </IconButton>
+                                      <IconButton
+                                        size="small"
+                                        onClick={() => moveStaticItem(source.id, item.id, 1)}
+                                        disabled={itemIndex === source.items.length - 1}
+                                      >
+                                        <ArrowDownwardRoundedIcon fontSize="small" />
+                                      </IconButton>
+                                      <IconButton size="small" color="error" onClick={() => deleteStaticItem(source.id, item.id)}>
+                                        <DeleteOutlineRoundedIcon fontSize="small" />
+                                      </IconButton>
+                                    </Stack>
+                                  ))}
+                                </Stack>
+                              </>
+                            )}
                           </Box>
                         )
                       ) : null}

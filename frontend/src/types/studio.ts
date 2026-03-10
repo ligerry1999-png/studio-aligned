@@ -3,6 +3,9 @@ export interface StudioModelOption {
   name: string;
 }
 
+export type StudioComposerMode = 'image' | 'text';
+export type MentionSourceContentType = 'image' | 'text';
+
 export interface StudioOptions {
   models: StudioModelOption[];
   aspect_ratios: string[];
@@ -14,6 +17,9 @@ export interface RuntimeHttpConfig {
   endpoint: string;
   api_key: string;
   api_key_managed_by_env?: boolean;
+  text_api_key: string;
+  text_api_key_managed_by_env?: boolean;
+  text_model: string;
   response_format: 'url' | 'b64_json';
   timeout_seconds: number;
   download_dir: string;
@@ -28,7 +34,9 @@ export interface MentionSourceItem {
   title: string;
   order: number;
   tags: string[];
-  storage_key: string;
+  item_type?: MentionSourceContentType;
+  content?: string;
+  storage_key?: string;
   file_url?: string;
   thumbnail_url?: string;
 }
@@ -39,6 +47,7 @@ export interface MentionSourceConfig {
   enabled: boolean;
   order: number;
   kind: 'dynamic' | 'static';
+  content_type?: MentionSourceContentType;
   items: MentionSourceItem[];
 }
 
@@ -56,6 +65,7 @@ export interface GenerationParams {
   aspect_ratio: string;
   quality: string;
   count: number;
+  prompt_pack_mode?: 'five_image_prompts';
 }
 
 export interface ComposerReference {
@@ -104,6 +114,7 @@ export interface StudioAsset {
 export interface StudioMessage {
   id: string;
   role: 'user' | 'assistant';
+  mode?: StudioComposerMode;
   text: string;
   created_at?: string;
   status?: string;
@@ -118,6 +129,7 @@ export interface WorkspaceSummary {
   name: string;
   created_at: string;
   updated_at: string;
+  composer_mode?: StudioComposerMode;
 }
 
 export interface WorkspaceDetail {
@@ -125,6 +137,7 @@ export interface WorkspaceDetail {
   name: string;
   created_at: string;
   updated_at: string;
+  composer_mode?: StudioComposerMode;
   messages: StudioMessage[];
 }
 

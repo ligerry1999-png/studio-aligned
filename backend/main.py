@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from service import (
     CreateSessionRequest,
@@ -9,7 +10,15 @@ from service import (
     ImportSessionRequest,
     RuntimeConfigRequest,
     SaveAnnotationRequest,
+    UpdateWorkspaceModeRequest,
     UpdateAssetRequest,
+    WorkflowBridgeConfigRequest,
+    WorkflowRunCreateRequest,
+    WorkflowRunPreviewRequest,
+    WorkflowPromptCardCreateRequest,
+    WorkflowPromptCardUpdateRequest,
+    WorkflowTemplateCreateRequest,
+    WorkflowTemplateUpdateRequest,
     app_service,
 )
 
@@ -74,6 +83,10 @@ def create_app() -> FastAPI:
     def get_workspace(workspace_id: str):
         return app_service.get_session_or_404(workspace_id)
 
+    @app.patch("/api/v1/workspaces/{workspace_id}/mode")
+    def update_workspace_mode(workspace_id: str, payload: UpdateWorkspaceModeRequest):
+        return app_service.update_session_mode(workspace_id, payload.mode)
+
     @app.delete("/api/v1/workspaces/{workspace_id}")
     def delete_workspace(workspace_id: str):
         app_service.delete_session(workspace_id)
@@ -117,6 +130,23 @@ def create_app() -> FastAPI:
             references=payload.references,
             annotation_context=payload.annotation_context,
             annotation_contexts=payload.annotation_contexts,
+        )
+
+    @app.post("/api/v1/workspaces/{workspace_id}/turns/text-stream")
+    def create_text_turn_stream(workspace_id: str, payload: CreateTurnRequest):
+        stream = app_service.stream_text_turn(
+            session_id=workspace_id,
+            text=payload.text,
+            params=payload.params,
+            attachment_asset_ids=payload.attachment_asset_ids,
+            references=payload.references,
+            annotation_context=payload.annotation_context,
+            annotation_contexts=payload.annotation_contexts,
+        )
+        return StreamingResponse(
+            stream,
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache"},
         )
 
     @app.delete("/api/v1/images/{image_id}")
@@ -179,6 +209,96 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/official-prompts")
     def get_official_prompts():
         return app_service.get_official_prompts()
+
+    @app.get("/api/v1/workflow/templates")
+    def list_workflow_templates():
+        return app_service.list_workflow_templates()
+
+    @app.get("/api/v1/workflow/prompt-cards")
+    def list_workflow_prompt_cards():
+        return app_service.list_workflow_prompt_cards()
+
+    @app.post("/api/v1/workflow/prompt-cards")
+    def create_workflow_prompt_card(payload: WorkflowPromptCardCreateRequest):
+        return app_service.create_workflow_prompt_card(payload)
+
+    @app.put("/api/v1/workflow/prompt-cards/{card_id}")
+    def update_workflow_prompt_card(card_id: str, payload: WorkflowPromptCardUpdateRequest):
+        return app_service.update_workflow_prompt_card(card_id=card_id, payload=payload)
+
+    @app.delete("/api/v1/workflow/prompt-cards/{card_id}")
+    def delete_workflow_prompt_card(card_id: str):
+        app_service.delete_workflow_prompt_card(card_id=card_id)
+        return {"status": "success"}
+
+    @app.get("/api/v1/workflow/runs")
+    def list_workflow_runs():
+        return app_service.list_workflow_runs()
+
+    @app.post("/api/v1/workflow/runs/preview")
+    def preview_workflow_run(payload: WorkflowRunPreviewRequest):
+        return app_service.preview_workflow_run(payload)
+
+    @app.post("/api/v1/workflow/runs")
+    def create_workflow_run(payload: WorkflowRunCreateRequest):
+        return app_service.create_workflow_run(payload)
+
+    @app.get("/api/v1/workflow/runs/{run_id}")
+    def get_workflow_run(run_id: str):
+        return app_service.get_workflow_run_or_404(run_id)
+
+    @app.post("/api/v1/workflow/runs/{run_id}/tasks/{task_id}/retry")
+    def retry_workflow_run_task(run_id: str, task_id: str):
+        return app_service.retry_workflow_run_task(run_id=run_id, task_id=task_id)
+
+    @app.post("/api/v1/workflow/templates")
+    def create_workflow_template(payload: WorkflowTemplateCreateRequest):
+        return app_service.create_workflow_template(payload)
+
+    @app.put("/api/v1/workflow/templates/{template_id}")
+    def update_workflow_template(template_id: str, payload: WorkflowTemplateUpdateRequest):
+        return app_service.update_workflow_template(template_id, payload)
+
+    @app.delete("/api/v1/workflow/templates/{template_id}")
+    def delete_workflow_template(template_id: str):
+        app_service.delete_workflow_template(template_id)
+        return {"status": "success"}
+
+    @app.get("/api/v1/workflow/bridge/config")
+    def get_workflow_bridge_config():
+        return app_service.get_workflow_bridge_config()
+
+    @app.put("/api/v1/workflow/bridge/config")
+    def update_workflow_bridge_config(payload: WorkflowBridgeConfigRequest):
+        return app_service.update_workflow_bridge_config(payload)
+
+    @app.get("/api/v1/workflow/bridge/options")
+    def bridge_get_options():
+        return app_service.bridge_get_options()
+
+    @app.get("/api/v1/workflow/bridge/workspaces")
+    def bridge_list_workspaces():
+        return app_service.bridge_list_workspaces()
+
+    @app.get("/api/v1/workflow/bridge/workspaces/{workspace_id}")
+    def bridge_get_workspace(workspace_id: str):
+        return app_service.bridge_get_workspace(workspace_id)
+
+    @app.get("/api/v1/workflow/bridge/assets/library")
+    def bridge_list_assets_library(
+        cursor: Optional[str] = None,
+        limit: int = 80,
+        kind: Optional[str] = None,
+        search: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ):
+        return app_service.bridge_list_assets(
+            cursor=cursor,
+            limit=limit,
+            kind=kind,
+            search=search,
+            workspace_id=workspace_id,
+        )
 
     @app.get("/healthz")
     def healthz():

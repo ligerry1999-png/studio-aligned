@@ -1,12 +1,14 @@
 import {
   Alert,
   Box,
+  Button,
   CircularProgress,
   Snackbar,
   Stack,
   Typography,
 } from '@mui/material';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link as RouterLink } from 'react-router-dom';
 
 import { studioApi, resolveAssetUrl } from '../api/client';
 import { AnnotatorDialog, type AnnotationDraftContext } from '../components/AnnotatorDialog';
@@ -25,8 +27,10 @@ import type {
   AnnotationContextPayload,
   RuntimeConfig,
   StudioAsset,
+  StudioComposerMode,
   StudioMessage,
   StudioOptions,
+  WorkspaceDetail,
   WorkspaceSummary,
 } from '../types/studio';
 
@@ -49,15 +53,15 @@ const WORKSPACE_PARAMS_STORAGE_KEY = 'studio_aligned_workspace_params_v1';
 interface PendingTurn {
   id: string;
   workspaceId: string;
+  mode: StudioComposerMode;
   text: string;
   params: GenerationParams;
   createdAt: string;
   startedAtMs: number | null;
-  status: 'queued' | 'running';
+  status: 'running';
 }
 
-interface PendingTurnRequest {
-  workspaceId: string;
+interface ImageTurnRequest {
   text: string;
   params: GenerationParams;
   attachmentIds: string[];
@@ -136,6 +140,10 @@ function normalizeWorkspaceParams(raw: Partial<GenerationParams> | null | undefi
 
 function sameParams(a: GenerationParams, b: GenerationParams): boolean {
   return a.model === b.model && a.aspect_ratio === b.aspect_ratio && a.quality === b.quality && a.count === b.count;
+}
+
+function normalizeComposerMode(mode: unknown): StudioComposerMode {
+  return mode === 'text' ? 'text' : 'image';
 }
 
 function readWorkspaceParamsMemory(): Record<string, Partial<GenerationParams>> {
@@ -563,6 +571,8 @@ export function StudioPage() {
   const [officialLoading, setOfficialLoading] = useState(false);
 
   const [params, setParams] = useState<GenerationParams>(DEFAULT_PARAMS);
+  const [composerMode, setComposerMode] = useState<StudioComposerMode>('image');
+  const [textPromptPackEnabled, setTextPromptPackEnabled] = useState(false);
   const [composerText, setComposerText] = useState('');
   const [composerReferences, setComposerReferences] = useState<ComposerReference[]>([]);
   const [savedAssets, setSavedAssets] = useState<StudioAsset[]>([]);
@@ -583,12 +593,10 @@ export function StudioPage() {
   const [mentionSettings, setMentionSettings] = useState<MentionSettings | null>(null);
   const [mentionSaving, setMentionSaving] = useState(false);
   const [pendingTurnsByWorkspace, setPendingTurnsByWorkspace] = useState<Record<string, PendingTurn[]>>({});
+  const [textStreamingCountByWorkspace, setTextStreamingCountByWorkspace] = useState<Record<string, number>>({});
   const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
   const currentWorkspaceIdRef = useRef<string | null>(null);
-  const pendingTurnsByWorkspaceRef = useRef<Record<string, PendingTurn[]>>({});
-  const pendingTurnRequestsRef = useRef<Record<string, PendingTurnRequest>>({});
-  const processingWorkspaceIdsRef = useRef<Set<string>>(new Set());
-  const hasPersistedRunningMessageRef = useRef<boolean>(false);
+  const currentWorkspaceRef = useRef<WorkspaceDetail | null>(null);
   const objectNameMapRef = useRef<Record<string, Record<string, string>>>({});
 
   const [toast, setToast] = useState<{ open: boolean; message: string; severity: 'success' | 'error' }>({
@@ -600,6 +608,33 @@ export function StudioPage() {
   function showToast(message: string, severity: 'success' | 'error' = 'success') {
     setToast({ open: true, message, severity });
   }
+
+  const adjustWorkspaceTextStreamingCount = useCallback((workspaceId: string, delta: number) => {
+    if (!workspaceId) return;
+    setTextStreamingCountByWorkspace((prev) => {
+      const current = Number(prev[workspaceId] || 0);
+      const nextCount = Math.max(0, current + delta);
+      if (nextCount === current) return prev;
+      const next = { ...prev };
+      if (nextCount <= 0) {
+        delete next[workspaceId];
+      } else {
+        next[workspaceId] = nextCount;
+      }
+      return next;
+    });
+  }, []);
+
+  const patchWorkspaceIfCurrent = useCallback(
+    (workspaceId: string, updater: (workspace: WorkspaceDetail) => WorkspaceDetail) => {
+      const existing = currentWorkspaceRef.current;
+      if (!existing || existing.id !== workspaceId) return;
+      const next = updater(existing);
+      currentWorkspaceRef.current = next;
+      setCurrentWorkspace(next);
+    },
+    [setCurrentWorkspace],
+  );
 
   const refreshSessions = useCallback(async (): Promise<WorkspaceSummary[]> => {
     const list = await studioApi.listWorkspaces();
@@ -718,7 +753,13 @@ export function StudioPage() {
 
   useEffect(() => {
     currentWorkspaceIdRef.current = currentWorkspace?.id ?? null;
-  }, [currentWorkspace?.id]);
+    currentWorkspaceRef.current = currentWorkspace ?? null;
+    if (!currentWorkspace?.id) {
+      setComposerMode('image');
+      return;
+    }
+    setComposerMode(normalizeComposerMode(currentWorkspace.composer_mode));
+  }, [currentWorkspace]);
   useEffect(() => {
     if (!options || !currentWorkspace?.id) return;
     const memory = readWorkspaceParamsMemory();
@@ -753,9 +794,6 @@ export function StudioPage() {
     () => Object.values(pendingTurnsByWorkspace).reduce((sum, list) => sum + list.length, 0),
     [pendingTurnsByWorkspace],
   );
-  useEffect(() => {
-    pendingTurnsByWorkspaceRef.current = pendingTurnsByWorkspace;
-  }, [pendingTurnsByWorkspace]);
 
   useEffect(() => {
     if (totalPendingTurns <= 0) return;
@@ -764,6 +802,10 @@ export function StudioPage() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [totalPendingTurns]);
+  const isCurrentWorkspaceTextStreaming = useMemo(() => {
+    if (!currentWorkspace?.id) return false;
+    return Number(textStreamingCountByWorkspace[currentWorkspace.id] || 0) > 0;
+  }, [currentWorkspace?.id, textStreamingCountByWorkspace]);
   const hasPersistedRunningMessage = useMemo(() => {
     if (!currentWorkspace) return false;
     return currentWorkspace.messages.some(
@@ -771,10 +813,7 @@ export function StudioPage() {
     );
   }, [currentWorkspace]);
   useEffect(() => {
-    hasPersistedRunningMessageRef.current = hasPersistedRunningMessage;
-  }, [hasPersistedRunningMessage]);
-  useEffect(() => {
-    if (!currentWorkspace?.id || !hasPersistedRunningMessage) return;
+    if (!currentWorkspace?.id || !hasPersistedRunningMessage || isCurrentWorkspaceTextStreaming) return;
     let disposed = false;
     let inFlight = false;
 
@@ -798,7 +837,7 @@ export function StudioPage() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [currentWorkspace?.id, hasPersistedRunningMessage, loadWorkspace, refreshSessions]);
+  }, [currentWorkspace?.id, hasPersistedRunningMessage, isCurrentWorkspaceTextStreaming, loadWorkspace, refreshSessions]);
 
   const workspaceTitle = useMemo(() => currentWorkspace?.name || '未选择会话', [currentWorkspace]);
   const workspaceMeta = useMemo(() => {
@@ -807,15 +846,7 @@ export function StudioPage() {
     if (pendingTurns.length === 0) {
       return `${messageCount} 条消息`;
     }
-    const runningCount = pendingTurns.filter((item) => item.status === 'running').length;
-    const queuedCount = Math.max(0, pendingTurns.length - runningCount);
-    if (runningCount > 0 && queuedCount > 0) {
-      return `${messageCount} 条消息 · 生成中 ${runningCount} · 排队 ${queuedCount}`;
-    }
-    if (runningCount > 0) {
-      return `${messageCount} 条消息 · 生成中 ${runningCount}`;
-    }
-    return `${messageCount} 条消息 · 排队 ${queuedCount}`;
+    return `${messageCount} 条消息 · 生成中 ${pendingTurns.length}`;
   }, [currentWorkspace, pendingTurnsByWorkspace]);
   const generatedAssets = useMemo(() => {
     if (!currentWorkspace) return [];
@@ -849,24 +880,17 @@ export function StudioPage() {
     const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
     if (pendingTurns.length === 0) return [];
     const nowMs = progressNowMs;
-    const visibleTurns = hasPersistedRunningMessage
-      ? pendingTurns.filter((turn) => turn.status === 'queued')
-      : pendingTurns;
-    if (visibleTurns.length === 0) return [];
-    const persistedRunningAhead = hasPersistedRunningMessage ? 1 : 0;
-    return visibleTurns.flatMap((turn, index) => {
+    return pendingTurns.flatMap((turn) => {
       const parsedCreatedAtMs = Date.parse(turn.createdAt);
       const createdAtMs = Number.isFinite(parsedCreatedAtMs) ? parsedCreatedAtMs : nowMs;
       const runningSinceMs = turn.startedAtMs ?? createdAtMs;
       const elapsedSeconds = Math.max(1, Math.floor((nowMs - runningSinceMs) / 1000));
-      const queueAheadCount = persistedRunningAhead + index;
-      const assistantText = turn.status === 'running'
-        ? `正在生成中... 已耗时 ${elapsedSeconds}s`
-        : `排队中... 前方还有 ${queueAheadCount} 个任务`;
+      const assistantText = `正在生成中... 已耗时 ${elapsedSeconds}s`;
       return [
         {
           id: `${turn.id}-user`,
           role: 'user',
+          mode: 'image',
           text: turn.text,
           params: turn.params,
           status: 'pending',
@@ -875,6 +899,7 @@ export function StudioPage() {
         {
           id: `${turn.id}-assistant`,
           role: 'assistant',
+          mode: 'image',
           text: assistantText,
           params: turn.params,
           status: 'running',
@@ -882,7 +907,7 @@ export function StudioPage() {
         },
       ];
     });
-  }, [currentWorkspace, pendingTurnsByWorkspace, progressNowMs, hasPersistedRunningMessage]);
+  }, [currentWorkspace, pendingTurnsByWorkspace, progressNowMs]);
 
   const displayWorkspace = useMemo(() => {
     if (!currentWorkspace) return null;
@@ -896,8 +921,8 @@ export function StudioPage() {
   const isCurrentWorkspaceSending = useMemo(() => {
     if (!currentWorkspace) return false;
     const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
-    return pendingTurns.some((item) => item.status === 'running') || hasPersistedRunningMessage;
-  }, [currentWorkspace, pendingTurnsByWorkspace, hasPersistedRunningMessage]);
+    return pendingTurns.some((item) => item.status === 'running') || hasPersistedRunningMessage || isCurrentWorkspaceTextStreaming;
+  }, [currentWorkspace, pendingTurnsByWorkspace, hasPersistedRunningMessage, isCurrentWorkspaceTextStreaming]);
 
   const handleAnnotationContextChange = useCallback((draft: AnnotationDraftContext) => {
     if (!annotatorTarget) return;
@@ -1025,14 +1050,7 @@ export function StudioPage() {
     return '';
   }, [annotationSendGuard.disabled, annotationSendGuard.reason]);
 
-  const isWorkspaceBlockedByPersistedRunning = useCallback((workspaceId: string): boolean => {
-    if (!workspaceId) return false;
-    if (workspaceId !== currentWorkspaceIdRef.current) return false;
-    return hasPersistedRunningMessageRef.current;
-  }, []);
-
   const removePendingTurn = useCallback((workspaceId: string, pendingId: string) => {
-    delete pendingTurnRequestsRef.current[pendingId];
     setPendingTurnsByWorkspace((prev) => {
       const list = prev[workspaceId] || [];
       const nextList = list.filter((item) => item.id !== pendingId);
@@ -1049,89 +1067,44 @@ export function StudioPage() {
     });
   }, []);
 
-  const processWorkspaceQueue = useCallback(async (workspaceId: string) => {
+  const runImageTurn = useCallback(async (workspaceId: string, pendingId: string, requestPayload: ImageTurnRequest) => {
     if (!workspaceId) return;
-    if (processingWorkspaceIdsRef.current.has(workspaceId)) return;
-    if (isWorkspaceBlockedByPersistedRunning(workspaceId)) return;
-    processingWorkspaceIdsRef.current.add(workspaceId);
     try {
-      while (true) {
-        if (isWorkspaceBlockedByPersistedRunning(workspaceId)) break;
-        const pendingList = pendingTurnsByWorkspaceRef.current[workspaceId] || [];
-        const nextTurn = pendingList.find((item) => item.status === 'queued');
-        if (!nextTurn) break;
-
-        const startedAtMs = Date.now();
-        setPendingTurnsByWorkspace((prev) => {
-          const list = prev[workspaceId] || [];
-          let changed = false;
-          const nextList: PendingTurn[] = list.map((item): PendingTurn => {
-            if (item.id !== nextTurn.id || item.status !== 'queued') return item;
-            changed = true;
-            return { ...item, status: 'running', startedAtMs };
-          });
-          if (!changed) return prev;
-          return {
-            ...prev,
-            [workspaceId]: nextList,
-          };
-        });
-
-        const requestPayload = pendingTurnRequestsRef.current[nextTurn.id];
-        if (!requestPayload) {
-          removePendingTurn(workspaceId, nextTurn.id);
-          continue;
-        }
-
-        try {
-          const result = await studioApi.createTurn(workspaceId, {
-            text: requestPayload.text,
-            params: requestPayload.params,
-            attachment_asset_ids: requestPayload.attachmentIds,
-            references: requestPayload.references,
-            annotation_contexts: requestPayload.annotationPayloads,
-          });
-          removePendingTurn(workspaceId, nextTurn.id);
-          if (currentWorkspaceIdRef.current === workspaceId) {
-            appendTurn(result.user_message, result.assistant_message);
-          }
-          try {
-            await refreshSessions();
-            await refreshDynamicSourceAssets();
-            if (currentWorkspaceIdRef.current === workspaceId) {
-              await loadWorkspace(workspaceId);
-            }
-          } catch {
-            // 后台生成成功后，列表刷新失败不应影响主流程
-          }
-          showToast('生成完成');
-        } catch (error) {
-          removePendingTurn(workspaceId, nextTurn.id);
-          try {
-            if (currentWorkspaceIdRef.current === workspaceId) {
-              await loadWorkspace(workspaceId);
-            }
-            await refreshSessions();
-          } catch {
-            // 错误态消息刷新失败时不阻塞提示
-          }
-          const message = error instanceof Error ? error.message : '生成失败';
-          showToast(message, 'error');
-        }
+      const result = await studioApi.createTurn(workspaceId, {
+        text: requestPayload.text,
+        params: requestPayload.params,
+        attachment_asset_ids: requestPayload.attachmentIds,
+        references: requestPayload.references,
+        annotation_contexts: requestPayload.annotationPayloads,
+      });
+      if (currentWorkspaceIdRef.current === workspaceId) {
+        appendTurn(result.user_message, result.assistant_message);
       }
+      try {
+        await refreshSessions();
+        await refreshDynamicSourceAssets();
+        if (currentWorkspaceIdRef.current === workspaceId) {
+          await loadWorkspace(workspaceId);
+        }
+      } catch {
+        // 后台生成成功后，列表刷新失败不应影响主流程
+      }
+      showToast('生成完成');
+    } catch (error) {
+      try {
+        if (currentWorkspaceIdRef.current === workspaceId) {
+          await loadWorkspace(workspaceId);
+        }
+        await refreshSessions();
+      } catch {
+        // 错误态消息刷新失败时不阻塞提示
+      }
+      const message = error instanceof Error ? error.message : '生成失败';
+      showToast(message, 'error');
     } finally {
-      processingWorkspaceIdsRef.current.delete(workspaceId);
+      removePendingTurn(workspaceId, pendingId);
     }
-  }, [appendTurn, isWorkspaceBlockedByPersistedRunning, loadWorkspace, refreshDynamicSourceAssets, refreshSessions, removePendingTurn]);
-
-  useEffect(() => {
-    const workspaceId = currentWorkspace?.id;
-    if (!workspaceId) return;
-    if (isWorkspaceBlockedByPersistedRunning(workspaceId)) return;
-    const hasQueuedTurns = (pendingTurnsByWorkspace[workspaceId] || []).some((item) => item.status === 'queued');
-    if (!hasQueuedTurns) return;
-    void processWorkspaceQueue(workspaceId);
-  }, [currentWorkspace?.id, isWorkspaceBlockedByPersistedRunning, pendingTurnsByWorkspace, processWorkspaceQueue]);
+  }, [appendTurn, loadWorkspace, refreshDynamicSourceAssets, refreshSessions, removePendingTurn]);
 
   async function handleCreateWorkspace() {
     const name = window.prompt('会话名称', '室内设计会话');
@@ -1152,13 +1125,13 @@ export function StudioPage() {
     if (!ok) return;
     try {
       await studioApi.deleteWorkspace(workspaceId);
-      Object.keys(pendingTurnRequestsRef.current).forEach((pendingId) => {
-        if (pendingTurnRequestsRef.current[pendingId]?.workspaceId === workspaceId) {
-          delete pendingTurnRequestsRef.current[pendingId];
-        }
-      });
-      processingWorkspaceIdsRef.current.delete(workspaceId);
       setPendingTurnsByWorkspace((prev) => {
+        if (!prev[workspaceId]) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+      setTextStreamingCountByWorkspace((prev) => {
         if (!prev[workspaceId]) return prev;
         const next = { ...prev };
         delete next[workspaceId];
@@ -1182,6 +1155,26 @@ export function StudioPage() {
       await loadWorkspace(workspaceId);
     } catch (error) {
       const message = error instanceof Error ? error.message : '加载会话失败';
+      showToast(message, 'error');
+    }
+  }
+
+  async function handleComposerModeChange(nextMode: StudioComposerMode) {
+    if (composerMode === nextMode) return;
+    const workspaceId = currentWorkspaceIdRef.current;
+    if (!workspaceId) return;
+    const previousMode = composerMode;
+    setComposerMode(nextMode);
+    try {
+      const updatedWorkspace = await studioApi.updateWorkspaceMode(workspaceId, nextMode);
+      if (currentWorkspaceIdRef.current === workspaceId) {
+        currentWorkspaceRef.current = updatedWorkspace;
+        setCurrentWorkspace(updatedWorkspace);
+      }
+      await refreshSessions();
+    } catch (error) {
+      setComposerMode(previousMode);
+      const message = error instanceof Error ? error.message : '切换模式失败';
       showToast(message, 'error');
     }
   }
@@ -1271,7 +1264,7 @@ export function StudioPage() {
     }
   }
 
-  function handleSendTurn() {
+  async function handleSendTurn() {
     if (!currentWorkspace) return;
     const targetWorkspaceId = currentWorkspace.id;
     const text = composerText.trim();
@@ -1304,42 +1297,204 @@ export function StudioPage() {
         move_relation: moveRelationToPayload(context.move_relation),
       }));
 
+    if (composerMode === 'text') {
+      setComposerText('');
+      setComposerReferences([]);
+      setAnnotationContextsByMention({});
+      objectNameMapRef.current = {};
+      setAnnotatorTarget(null);
+      setLightboxAsset(null);
+
+      let assistantMessageId = '';
+      let streamErrorMessage = '';
+      adjustWorkspaceTextStreamingCount(targetWorkspaceId, 1);
+      try {
+        const textTurnParams: GenerationParams = textPromptPackEnabled
+          ? { ...params, prompt_pack_mode: 'five_image_prompts' }
+          : { ...params };
+        await studioApi.createTextTurnStream(
+          targetWorkspaceId,
+          {
+            text,
+            params: textTurnParams,
+            attachment_asset_ids: attachmentIds,
+            references: ordered,
+            annotation_contexts: annotationPayloads,
+          },
+          {
+            onStart: (event) => {
+              assistantMessageId = event.assistant_message.id;
+              patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+                const messages = [...workspace.messages];
+                const upsert = (message: StudioMessage) => {
+                  const idx = messages.findIndex((item) => item.id === message.id);
+                  if (idx >= 0) {
+                    messages[idx] = { ...messages[idx], ...message };
+                  } else {
+                    messages.push(message);
+                  }
+                };
+                upsert(event.user_message);
+                upsert(event.assistant_message);
+                return {
+                  ...workspace,
+                  messages,
+                  updated_at: new Date().toISOString(),
+                };
+              });
+            },
+            onDelta: (event) => {
+              if (!assistantMessageId) return;
+              patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => ({
+                ...workspace,
+                messages: workspace.messages.map((message) =>
+                  message.id === assistantMessageId
+                    ? { ...message, text: event.assistant_text || `${message.text || ''}${event.delta || ''}`, status: 'running' }
+                    : message,
+                ),
+                updated_at: new Date().toISOString(),
+              }));
+            },
+            onDone: (event) => {
+              patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+                const messages = [...workspace.messages];
+                const upsert = (message: StudioMessage) => {
+                  const idx = messages.findIndex((item) => item.id === message.id);
+                  if (idx >= 0) {
+                    messages[idx] = { ...messages[idx], ...message };
+                  } else {
+                    messages.push(message);
+                  }
+                };
+                upsert(event.user_message);
+                upsert(event.assistant_message);
+                return {
+                  ...workspace,
+                  messages,
+                  updated_at: new Date().toISOString(),
+                };
+              });
+            },
+            onError: (event) => {
+              streamErrorMessage = event.message || '文本生成失败';
+              patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+                const messages = workspace.messages.map((message) => {
+                  if (event.assistant_message && message.id === event.assistant_message.id) {
+                    return { ...message, ...event.assistant_message };
+                  }
+                  if (!event.assistant_message && assistantMessageId && message.id === assistantMessageId) {
+                    return {
+                      ...message,
+                      status: 'failed',
+                      text: `文本生成失败：${streamErrorMessage}`,
+                    };
+                  }
+                  return message;
+                });
+                return {
+                  ...workspace,
+                  messages,
+                  updated_at: new Date().toISOString(),
+                };
+              });
+            },
+          },
+        );
+        try {
+          await refreshSessions();
+          await refreshDynamicSourceAssets();
+          if (currentWorkspaceIdRef.current === targetWorkspaceId) {
+            await loadWorkspace(targetWorkspaceId);
+          }
+        } catch {
+          // 文本回复完成后的刷新失败不阻塞主流程
+        }
+        if (streamErrorMessage) {
+          showToast(streamErrorMessage, 'error');
+        } else {
+          showToast('文本回复完成');
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '文本生成失败';
+        showToast(message, 'error');
+        try {
+          if (currentWorkspaceIdRef.current === targetWorkspaceId) {
+            await loadWorkspace(targetWorkspaceId);
+          }
+          await refreshSessions();
+        } catch {
+          // 失败态刷新异常时不阻塞提示
+        }
+      } finally {
+        adjustWorkspaceTextStreamingCount(targetWorkspaceId, -1);
+      }
+      return;
+    }
+
+    setComposerText('');
+    setComposerReferences([]);
+    setAnnotationContextsByMention({});
+    objectNameMapRef.current = {};
+    setAnnotatorTarget(null);
+    setLightboxAsset(null);
+
     const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const pendingTurn: PendingTurn = {
       id: pendingId,
       workspaceId: targetWorkspaceId,
+      mode: 'image',
       text,
       params: { ...params },
       createdAt: new Date().toISOString(),
-      startedAtMs: null,
-      status: 'queued',
+      startedAtMs: Date.now(),
+      status: 'running',
     };
-    pendingTurnRequestsRef.current[pendingId] = {
-      workspaceId: targetWorkspaceId,
+    const requestPayload: ImageTurnRequest = {
       text,
       params: { ...params },
       attachmentIds,
       references: ordered,
       annotationPayloads,
     };
-    const queueAheadCount =
-      (pendingTurnsByWorkspaceRef.current[targetWorkspaceId]?.length ?? 0) +
-      (isWorkspaceBlockedByPersistedRunning(targetWorkspaceId) ? 1 : 0);
     setPendingTurnsByWorkspace((prev) => ({
       ...prev,
       [targetWorkspaceId]: (prev[targetWorkspaceId] || []).concat(pendingTurn),
     }));
-    setComposerText('');
-    setComposerReferences([]);
-    setAnnotationContextsByMention({});
-    objectNameMapRef.current = {};
-    // 发送即退出标注模式，回到消息流视图
-    setAnnotatorTarget(null);
-    setLightboxAsset(null);
-    if (queueAheadCount > 0) {
-      showToast(`已加入队列，前方还有 ${queueAheadCount} 个任务`);
+    void runImageTurn(targetWorkspaceId, pendingId, requestPayload);
+  }
+
+  function handleGenerateImageFromTextPrompt(promptText: string) {
+    const workspaceId = currentWorkspaceIdRef.current;
+    const normalizedPrompt = String(promptText || '').trim();
+    if (!workspaceId) return;
+    if (!normalizedPrompt) {
+      showToast('提示词为空，无法生图', 'error');
+      return;
     }
-    void processWorkspaceQueue(targetWorkspaceId);
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const pendingTurn: PendingTurn = {
+      id: pendingId,
+      workspaceId,
+      mode: 'image',
+      text: normalizedPrompt,
+      params: { ...params },
+      createdAt: new Date().toISOString(),
+      startedAtMs: Date.now(),
+      status: 'running',
+    };
+    setPendingTurnsByWorkspace((prev) => ({
+      ...prev,
+      [workspaceId]: (prev[workspaceId] || []).concat(pendingTurn),
+    }));
+    const requestPayload: ImageTurnRequest = {
+      text: normalizedPrompt,
+      params: { ...params },
+      attachmentIds: [],
+      references: [],
+      annotationPayloads: [],
+    };
+    void runImageTurn(workspaceId, pendingId, requestPayload);
+    showToast('已开始生图任务');
   }
 
   async function reloadCurrentWorkspace() {
@@ -1430,6 +1585,7 @@ export function StudioPage() {
       if (action === 'add') {
         const source = asset.kind === 'official' ? 'official' : asset.kind === 'generated' ? 'generated' : 'library';
         queueInsertAsset(asset, source);
+        setLightboxAsset(null);
         showToast('已插入到对话框');
         return;
       }
@@ -1539,12 +1695,25 @@ export function StudioPage() {
             <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
               {/* Header */}
               <Box sx={{ mb: 2 }}>
-                <Typography variant="h6" fontWeight={700}>
-                  {workspaceTitle}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {workspaceMeta}
-                </Typography>
+                <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between">
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="h6" fontWeight={700} noWrap>
+                      {workspaceTitle}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {workspaceMeta}
+                    </Typography>
+                  </Box>
+                  <Button
+                    component={RouterLink}
+                    to="/workflow"
+                    variant="outlined"
+                    size="small"
+                    sx={{ flexShrink: 0 }}
+                  >
+                    切换到画布模式
+                  </Button>
+                </Stack>
               </Box>
               
               {/* Workspace Content + Floating Composer */}
@@ -1556,18 +1725,22 @@ export function StudioPage() {
                     onImageAction={(action, asset) => {
                       void handleImageAction(action, asset);
                     }}
+                    onGenerateTextPromptImage={(prompt) => {
+                      handleGenerateImageFromTextPrompt(prompt);
+                    }}
                   />
                 </Box>
 
                 <ComposerDock
                   workspaceId={currentWorkspace?.id || null}
+                  mode={composerMode}
                   text={composerText}
                   references={composerReferences}
                   params={params}
                   options={options}
                   annotationActive={Boolean(annotatorTarget)}
                   annotationPreservedMentionIds={annotationContexts.map((item) => item.mention_id)}
-                  sendDisabled={annotationSendGuard.disabled}
+                  sendDisabled={Boolean(composerSendDisabledReason)}
                   sendDisabledReason={composerSendDisabledReason}
                   uploadAssets={uploadSourceAssets}
                   generatedAssets={generatedAssets}
@@ -1589,6 +1762,11 @@ export function StudioPage() {
                   onTextChange={setComposerText}
                   onReferencesChange={handleComposerReferencesChange}
                   onParamsChange={(patch) => setParams((prev) => ({ ...prev, ...patch }))}
+                  onModeChange={(nextMode) => {
+                    void handleComposerModeChange(nextMode);
+                  }}
+                  textPromptPackEnabled={textPromptPackEnabled}
+                  onTextPromptPackEnabledChange={setTextPromptPackEnabled}
                   onUploadFiles={handleUploadFiles}
                   onConsumeInsertAssetRequest={() => setInsertAssetRequest(null)}
                   onAnnotateReference={handleAnnotateReference}

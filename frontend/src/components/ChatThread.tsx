@@ -4,6 +4,7 @@ import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded';
 import EditNoteRoundedIcon from '@mui/icons-material/EditNoteRounded';
 import {
+  Button,
   Box,
   Chip,
   IconButton,
@@ -14,7 +15,7 @@ import {
 import { useEffect, useMemo, useState } from 'react';
 
 import { resolveAssetUrl } from '../api/client';
-import type { GenerationParams, StudioAsset, StudioMessage, WorkspaceDetail } from '../types/studio';
+import type { GenerationParams, StudioAsset, StudioComposerMode, StudioMessage, WorkspaceDetail } from '../types/studio';
 
 export type ImageAction = 'copy' | 'download' | 'add' | 'annotate' | 'zoom' | 'delete';
 
@@ -22,13 +23,16 @@ interface ChatThreadProps {
   workspace: WorkspaceDetail | null;
   onOpenAsset: (asset: StudioAsset) => void;
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
+  onGenerateTextPromptImage: (prompt: string) => void;
 }
 
 type TaskStatus = 'completed' | 'running' | 'failed';
 
 interface TaskItem {
   id: string;
+  mode: StudioComposerMode;
   text: string;
+  assistantText: string;
   created_at?: string;
   params?: Partial<GenerationParams>;
   attachments: StudioAsset[];
@@ -37,10 +41,24 @@ interface TaskItem {
   runningText: string;
 }
 
+interface ParsedPromptOption {
+  title: string;
+  prompt: string;
+}
+
+interface ParsedPromptPack {
+  options: ParsedPromptOption[];
+  followUp: string;
+}
+
 function normalizeTaskStatus(value?: string): TaskStatus {
   if (value === 'running') return 'running';
   if (value === 'failed') return 'failed';
   return 'completed';
+}
+
+function normalizeMode(value?: string): StudioComposerMode {
+  return value === 'text' ? 'text' : 'image';
 }
 
 function elapsedSecondsFromCreatedAt(createdAt?: string, nowMs: number = Date.now()): number | null {
@@ -73,6 +91,173 @@ function isDeletedAsset(asset: StudioAsset): boolean {
   return asset.kind === 'deleted' || Boolean(asset.deleted);
 }
 
+function tryParseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced?.[1]) {
+      try {
+        return JSON.parse(fenced[1]);
+      } catch {
+        return null;
+      }
+    }
+    const firstBrace = raw.indexOf('{');
+    const lastBrace = raw.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      const candidate = raw.slice(firstBrace, lastBrace + 1);
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function extractBalancedArrayAfterKey(raw: string, key: string): string | null {
+  const keyPattern = new RegExp(`["']?${key}["']?\\s*:\\s*\\[`, 'i');
+  const matched = keyPattern.exec(raw);
+  if (!matched) return null;
+  const startBracket = raw.indexOf('[', matched.index);
+  if (startBracket < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let stringQuote = '"';
+  let escaped = false;
+  for (let i = startBracket; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === '\'') {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === '[') {
+      depth += 1;
+      continue;
+    }
+    if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) {
+        return raw.slice(startBracket, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parsePromptPackByRecovery(raw: string): ParsedPromptPack | null {
+  const source = String(raw || '').trim();
+  if (!source) return null;
+
+  // Case: returned text starts with options key but misses leading "{"/quote.
+  const repaired = source
+    .replace(/^\s*\{?\s*['"]?options['"]?\s*:/i, '{"options":')
+    .replace(/,\s*['"]?follow[\s_]?up['"]?\s*:/i, ',"follow_up":');
+  const repairedClosed = repaired.endsWith('}') ? repaired : `${repaired}}`;
+  const repairedParsed = tryParseJson(repairedClosed);
+  if (repairedParsed && typeof repairedParsed === 'object') {
+    const payload = repairedParsed as Record<string, unknown>;
+    const optionsRaw = Array.isArray(payload.options) ? payload.options : null;
+    if (optionsRaw && optionsRaw.length > 0) {
+      const options = optionsRaw
+        .map((item, index): ParsedPromptOption | null => {
+          if (!item || typeof item !== 'object') return null;
+          const row = item as Record<string, unknown>;
+          const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
+          const prompt = String(row.prompt || row.content || row.text || '').trim();
+          if (!prompt) return null;
+          return { title, prompt };
+        })
+        .filter((item): item is ParsedPromptOption => Boolean(item))
+        .slice(0, 5);
+      if (options.length > 0) {
+        const followUp = String(payload.follow_up || payload.followUp || '').trim();
+        return { options, followUp };
+      }
+    }
+  }
+
+  // Case: object wrapper broken, but options array body is still valid JSON.
+  const optionsArrayText = extractBalancedArrayAfterKey(source, 'options');
+  if (!optionsArrayText) return null;
+  try {
+    const arr = JSON.parse(optionsArrayText) as unknown[];
+    const options = arr
+      .map((item, index): ParsedPromptOption | null => {
+        if (!item || typeof item !== 'object') return null;
+        const row = item as Record<string, unknown>;
+        const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
+        const prompt = String(row.prompt || row.content || row.text || '').trim();
+        if (!prompt) return null;
+        return { title, prompt };
+      })
+      .filter((item): item is ParsedPromptOption => Boolean(item))
+      .slice(0, 5);
+    if (options.length === 0) return null;
+    const followMatch = source.match(/["']?follow[\s_]?up["']?\s*:\s*"([^"]*)"/i);
+    const followUp = String(followMatch?.[1] || '').trim();
+    return { options, followUp };
+  } catch {
+    return null;
+  }
+}
+
+function parsePromptPack(text: string): ParsedPromptPack | null {
+  const parsed = tryParseJson(String(text || '').trim());
+  if (!parsed || typeof parsed !== 'object') {
+    return parsePromptPackByRecovery(text);
+  }
+  const payload = parsed as Record<string, unknown>;
+  const listRaw = Array.isArray(payload.options)
+    ? payload.options
+    : Array.isArray(payload.prompts)
+      ? payload.prompts
+      : Array.isArray(payload.variants)
+        ? payload.variants
+        : null;
+  if (!listRaw || listRaw.length === 0) {
+    return parsePromptPackByRecovery(text);
+  }
+  const options = listRaw
+    .map((item, index): ParsedPromptOption | null => {
+      if (typeof item === 'string') {
+        const prompt = item.trim();
+        if (!prompt) return null;
+        return { title: `方案${index + 1}`, prompt };
+      }
+      if (!item || typeof item !== 'object') return null;
+      const row = item as Record<string, unknown>;
+      const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
+      const prompt = String(row.prompt || row.content || row.text || '').trim();
+      if (!prompt) return null;
+      return { title, prompt };
+    })
+    .filter((item): item is ParsedPromptOption => Boolean(item))
+    .slice(0, 5);
+  if (options.length === 0) {
+    return parsePromptPackByRecovery(text);
+  }
+  const followUp = String(payload.follow_up || payload.followUp || '').trim();
+  return { options, followUp };
+}
+
 function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
   const tasks: TaskItem[] = [];
 
@@ -87,9 +272,12 @@ function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
     }
 
     const status = normalizeTaskStatus(assistant?.status || current.status);
+    const mode = normalizeMode(assistant?.mode || current.mode);
     tasks.push({
       id: current.id,
+      mode,
       text: current.text || '',
+      assistantText: assistant?.text || '',
       created_at: current.created_at || assistant?.created_at,
       params: current.params || assistant?.params,
       attachments: current.attachments || [],
@@ -108,17 +296,24 @@ function TaskCard({
   nowMs,
   onOpenAsset,
   onImageAction,
+  onGenerateTextPromptImage,
 }: {
   task: TaskItem;
   order: number;
   nowMs: number;
   onOpenAsset: (asset: StudioAsset) => void;
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
+  onGenerateTextPromptImage: (prompt: string) => void;
 }) {
   const metaItems = formatTaskMetaItems(task.params);
-  const hasResultPanel = task.status === 'running' || task.status === 'failed' || task.images.length > 0;
+  const hasTextResult = task.mode === 'text' && Boolean((task.assistantText || '').trim());
+  const hasResultPanel = task.status === 'running' || task.status === 'failed' || task.images.length > 0 || hasTextResult;
   const pendingImageCount = Math.max(1, Math.min(4, Number(task.params?.count || 1) || 1));
-  const runningText = task.status === 'running' ? buildRunningText(task.runningText, task.created_at, nowMs) : '';
+  const runningText = task.status === 'running'
+    ? buildRunningText(task.runningText || task.assistantText, task.created_at, nowMs)
+    : '';
+  const isPromptPackTask = task.mode === 'text' && task.params?.prompt_pack_mode === 'five_image_prompts';
+  const parsedPromptPack = isPromptPackTask && task.status !== 'running' ? parsePromptPack(task.assistantText || '') : null;
 
   return (
     <Box sx={{ borderRadius: 2.2, border: '1px solid rgba(0,0,0,0.07)', bgcolor: '#f9f4ed', p: 1.1 }}>
@@ -142,7 +337,7 @@ function TaskCard({
             <Stack direction="row" spacing={0.7} alignItems="center" useFlexGap flexWrap="wrap" sx={{ minWidth: 0, flex: 1 }}>
               <Chip
                 size="small"
-                label="IMAGE"
+                label={task.mode.toUpperCase()}
                 sx={{
                   height: 20,
                   borderRadius: 5,
@@ -249,7 +444,7 @@ function TaskCard({
               py: 0.7,
             }}
           >
-            {task.status === 'running' ? (
+            {task.status === 'running' && task.mode === 'image' ? (
               <Typography variant="body2" sx={{ mb: 0.9, color: '#3d6a4e', fontWeight: 600 }}>
                 {runningText || '正在生成中...'}
               </Typography>
@@ -257,11 +452,64 @@ function TaskCard({
 
             {task.status === 'failed' ? (
               <Typography variant="body2" sx={{ mb: 0.9, color: '#b2433d', fontWeight: 700 }}>
-                任务生成失败，请重试。
+                {task.assistantText || '任务生成失败，请重试。'}
               </Typography>
             ) : null}
 
-            {task.images.length > 0 ? (
+            {task.mode === 'text' && task.status !== 'failed' ? (
+              task.status === 'running' ? (
+                <Typography
+                  variant="body2"
+                  sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.65 }}
+                >
+                  {runningText || '正在思考中...'}
+                </Typography>
+              ) : parsedPromptPack ? (
+                <Stack spacing={0.8} sx={{ minWidth: 280 }}>
+                  {parsedPromptPack.options.map((item, index) => (
+                    <Box
+                      key={`${task.id}-prompt-pack-${index}`}
+                      sx={{
+                        borderRadius: 1.1,
+                        border: '1px solid rgba(0,0,0,0.09)',
+                        bgcolor: '#ffffff',
+                        p: 0.8,
+                      }}
+                    >
+                      <Stack direction="row" spacing={0.8} alignItems="center" justifyContent="space-between" sx={{ mb: 0.4 }}>
+                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#2e2a25' }}>
+                          {item.title || `方案${index + 1}`}
+                        </Typography>
+                        <Button
+                          size="small"
+                          onClick={() => onGenerateTextPromptImage(item.prompt)}
+                          sx={{ minWidth: 56, px: 1, py: 0.1, fontSize: 12, fontWeight: 700 }}
+                        >
+                          生图
+                        </Button>
+                      </Stack>
+                      <Typography variant="body2" sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.62 }}>
+                        {item.prompt}
+                      </Typography>
+                    </Box>
+                  ))}
+                  {parsedPromptPack.followUp ? (
+                    <Typography variant="caption" sx={{ color: '#5f6a76' }}>
+                      {parsedPromptPack.followUp}
+                    </Typography>
+                  ) : null}
+                </Stack>
+              ) : (
+                <Typography
+                  variant="body2"
+                  sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.65 }}
+                >
+                  {task.assistantText || '已完成。'}
+                </Typography>
+              )
+            ) : null}
+
+            {task.mode === 'image' && task.images.length > 0 ? (
               <Box
                 sx={{
                   mt: 0.8,
@@ -385,7 +633,7 @@ function TaskCard({
                   </Box>
                 ))}
               </Box>
-            ) : task.status === 'running' ? (
+            ) : task.mode === 'image' && task.status === 'running' ? (
               <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mt: 0.8 }}>
                 {Array.from({ length: pendingImageCount }).map((_, idx) => (
                   <Box
@@ -408,7 +656,7 @@ function TaskCard({
   );
 }
 
-export function ChatThread({ workspace, onOpenAsset, onImageAction }: ChatThreadProps) {
+export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTextPromptImage }: ChatThreadProps) {
   const messages = workspace?.messages;
   const tasks = useMemo(() => mergeMessagesToTasks(messages || []), [messages]);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -452,6 +700,7 @@ export function ChatThread({ workspace, onOpenAsset, onImageAction }: ChatThread
             nowMs={nowMs}
             onOpenAsset={onOpenAsset}
             onImageAction={onImageAction}
+            onGenerateTextPromptImage={onGenerateTextPromptImage}
           />
         ))}
       </Stack>
