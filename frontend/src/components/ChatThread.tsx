@@ -15,7 +15,7 @@ import {
 import { useEffect, useMemo, useState } from 'react';
 
 import { resolveAssetUrl } from '../api/client';
-import type { GenerationParams, StudioAsset, StudioComposerMode, StudioMessage, WorkspaceDetail } from '../types/studio';
+import type { ComposerReference, GenerationParams, StudioAsset, StudioComposerMode, StudioMessage, WorkspaceDetail } from '../types/studio';
 
 export type ImageAction = 'copy' | 'download' | 'add' | 'annotate' | 'zoom' | 'delete';
 
@@ -23,7 +23,8 @@ interface ChatThreadProps {
   workspace: WorkspaceDetail | null;
   onOpenAsset: (asset: StudioAsset) => void;
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
-  onGenerateTextPromptImage: (prompt: string) => void;
+  onGenerateTextPromptImage: (payload: TextPromptImageSelectionPayload) => void;
+  onSelectTextPromptOption: (payload: TextPromptOptionSelectionPayload) => void;
 }
 
 type TaskStatus = 'completed' | 'running' | 'failed';
@@ -36,20 +37,59 @@ interface TaskItem {
   created_at?: string;
   params?: Partial<GenerationParams>;
   attachments: StudioAsset[];
+  attachmentAssetIds: string[];
+  references: ComposerReference[];
   images: StudioAsset[];
   status: TaskStatus;
   runningText: string;
 }
 
-interface ParsedPromptOption {
+export interface TextPromptOptionSelectionPayload {
+  sourceTaskId: string;
+  sourceText: string;
+  optionId: string;
+  title: string;
+  summary: string;
+  attachmentAssetIds: string[];
+  references: ComposerReference[];
+}
+
+export interface TextPromptImageSelectionPayload {
+  sourceTaskId: string;
+  prompt: string;
+  attachmentAssetIds: string[];
+  references: ComposerReference[];
+}
+
+interface ParsedPhase1Option {
+  id: string;
+  title: string;
+  summary: string;
+}
+
+interface ParsedPhase2Prompt {
+  id: string;
   title: string;
   prompt: string;
 }
 
-interface ParsedPromptPack {
-  options: ParsedPromptOption[];
+interface ParsedPromptPackPhase1 {
+  phase: 'phase1_options';
+  options: ParsedPhase1Option[];
+  anchors: string[];
+  diagnosisPros: string[];
+  diagnosisCons: string[];
   followUp: string;
 }
+
+interface ParsedPromptPackPhase2 {
+  phase: 'phase2_prompts';
+  prompts: ParsedPhase2Prompt[];
+  selectedOptionTitle: string;
+  followUp: string;
+}
+
+type ParsedPromptPack = ParsedPromptPackPhase1 | ParsedPromptPackPhase2;
 
 function normalizeTaskStatus(value?: string): TaskStatus {
   if (value === 'running') return 'running';
@@ -162,11 +202,80 @@ function extractBalancedArrayAfterKey(raw: string, key: string): string | null {
   return null;
 }
 
+function normalizeText(value: unknown): string {
+  return String(value ?? '').trim();
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeText(item))
+    .filter(Boolean);
+}
+
+function parsePhase2PromptItem(item: unknown, index: number): ParsedPhase2Prompt | null {
+  if (typeof item === 'string') {
+    const prompt = item.trim();
+    if (!prompt) return null;
+    return {
+      id: `p${index + 1}`,
+      title: `提示词${index + 1}`,
+      prompt,
+    };
+  }
+  if (!item || typeof item !== 'object') return null;
+  const row = item as Record<string, unknown>;
+  const prompt = normalizeText(row.prompt || row.content || row.text);
+  if (!prompt) return null;
+  const title = normalizeText(row.title || row.name || row.label) || `提示词${index + 1}`;
+  const id = normalizeText(row.id) || `p${index + 1}`;
+  return { id, title, prompt };
+}
+
+function parsePhase1OptionItem(item: unknown, index: number): ParsedPhase1Option | null {
+  if (!item || typeof item !== 'object') return null;
+  const row = item as Record<string, unknown>;
+  const title = normalizeText(row.title || row.name || row.label) || `方案${index + 1}`;
+  const summary = normalizeText(row.summary || row.desc || row.description || row.content || row.text || row.prompt);
+  if (!summary) return null;
+  const id = normalizeText(row.id) || `opt${index + 1}`;
+  return { id, title, summary };
+}
+
+function parseLegacyPromptRows(rows: unknown[], followUp = ''): ParsedPromptPackPhase2 | null {
+  const prompts = rows
+    .map((item, index) => parsePhase2PromptItem(item, index))
+    .filter((item): item is ParsedPhase2Prompt => Boolean(item))
+    .slice(0, 3);
+  if (prompts.length === 0) return null;
+  return {
+    phase: 'phase2_prompts',
+    prompts,
+    selectedOptionTitle: '',
+    followUp,
+  };
+}
+
+function parsePhase1OptionRows(rows: unknown[], followUp = ''): ParsedPromptPackPhase1 | null {
+  const options = rows
+    .map((item, index) => parsePhase1OptionItem(item, index))
+    .filter((item): item is ParsedPhase1Option => Boolean(item))
+    .slice(0, 3);
+  if (options.length === 0) return null;
+  return {
+    phase: 'phase1_options',
+    options,
+    anchors: [],
+    diagnosisPros: [],
+    diagnosisCons: [],
+    followUp,
+  };
+}
+
 function parsePromptPackByRecovery(raw: string): ParsedPromptPack | null {
   const source = String(raw || '').trim();
   if (!source) return null;
 
-  // Case: returned text starts with options key but misses leading "{"/quote.
   const repaired = source
     .replace(/^\s*\{?\s*['"]?options['"]?\s*:/i, '{"options":')
     .replace(/,\s*['"]?follow[\s_]?up['"]?\s*:/i, ',"follow_up":');
@@ -176,44 +285,22 @@ function parsePromptPackByRecovery(raw: string): ParsedPromptPack | null {
     const payload = repairedParsed as Record<string, unknown>;
     const optionsRaw = Array.isArray(payload.options) ? payload.options : null;
     if (optionsRaw && optionsRaw.length > 0) {
-      const options = optionsRaw
-        .map((item, index): ParsedPromptOption | null => {
-          if (!item || typeof item !== 'object') return null;
-          const row = item as Record<string, unknown>;
-          const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
-          const prompt = String(row.prompt || row.content || row.text || '').trim();
-          if (!prompt) return null;
-          return { title, prompt };
-        })
-        .filter((item): item is ParsedPromptOption => Boolean(item))
-        .slice(0, 5);
-      if (options.length > 0) {
-        const followUp = String(payload.follow_up || payload.followUp || '').trim();
-        return { options, followUp };
-      }
+      return (
+        parseLegacyPromptRows(optionsRaw, normalizeText(payload.follow_up || payload.followUp))
+        || parsePhase1OptionRows(optionsRaw, normalizeText(payload.follow_up || payload.followUp))
+      );
     }
   }
 
-  // Case: object wrapper broken, but options array body is still valid JSON.
   const optionsArrayText = extractBalancedArrayAfterKey(source, 'options');
   if (!optionsArrayText) return null;
   try {
-    const arr = JSON.parse(optionsArrayText) as unknown[];
-    const options = arr
-      .map((item, index): ParsedPromptOption | null => {
-        if (!item || typeof item !== 'object') return null;
-        const row = item as Record<string, unknown>;
-        const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
-        const prompt = String(row.prompt || row.content || row.text || '').trim();
-        if (!prompt) return null;
-        return { title, prompt };
-      })
-      .filter((item): item is ParsedPromptOption => Boolean(item))
-      .slice(0, 5);
-    if (options.length === 0) return null;
+    const rows = JSON.parse(optionsArrayText) as unknown[];
     const followMatch = source.match(/["']?follow[\s_]?up["']?\s*:\s*"([^"]*)"/i);
-    const followUp = String(followMatch?.[1] || '').trim();
-    return { options, followUp };
+    return (
+      parseLegacyPromptRows(rows, normalizeText(followMatch?.[1] || ''))
+      || parsePhase1OptionRows(rows, normalizeText(followMatch?.[1] || ''))
+    );
   } catch {
     return null;
   }
@@ -225,37 +312,63 @@ function parsePromptPack(text: string): ParsedPromptPack | null {
     return parsePromptPackByRecovery(text);
   }
   const payload = parsed as Record<string, unknown>;
-  const listRaw = Array.isArray(payload.options)
-    ? payload.options
-    : Array.isArray(payload.prompts)
+  const phase = normalizeText(payload.phase);
+  const followUp = normalizeText(payload.follow_up || payload.followUp);
+
+  if (phase === 'phase1_options') {
+    const optionsRaw = Array.isArray(payload.options) ? payload.options : [];
+    const options = optionsRaw
+      .map((item, index) => parsePhase1OptionItem(item, index))
+      .filter((item): item is ParsedPhase1Option => Boolean(item))
+      .slice(0, 3);
+    if (options.length === 0) return null;
+    const diagnosis = payload.diagnosis && typeof payload.diagnosis === 'object'
+      ? payload.diagnosis as Record<string, unknown>
+      : {};
+    return {
+      phase: 'phase1_options',
+      options,
+      anchors: parseStringArray(payload.anchors),
+      diagnosisPros: parseStringArray(diagnosis.pros),
+      diagnosisCons: parseStringArray(diagnosis.cons),
+      followUp,
+    };
+  }
+
+  if (phase === 'phase2_prompts') {
+    const promptsRaw = Array.isArray(payload.prompts)
       ? payload.prompts
+      : Array.isArray(payload.options)
+        ? payload.options
+        : [];
+    const prompts = promptsRaw
+      .map((item, index) => parsePhase2PromptItem(item, index))
+      .filter((item): item is ParsedPhase2Prompt => Boolean(item))
+      .slice(0, 3);
+    if (prompts.length === 0) return null;
+    const selected = payload.selected_option && typeof payload.selected_option === 'object'
+      ? payload.selected_option as Record<string, unknown>
+      : {};
+    const selectedOptionTitle = normalizeText(selected.title || payload.selected_option_title);
+    return {
+      phase: 'phase2_prompts',
+      prompts,
+      selectedOptionTitle,
+      followUp,
+    };
+  }
+
+  const listRaw = Array.isArray(payload.prompts)
+    ? payload.prompts
+    : Array.isArray(payload.options)
+      ? payload.options
       : Array.isArray(payload.variants)
         ? payload.variants
         : null;
   if (!listRaw || listRaw.length === 0) {
     return parsePromptPackByRecovery(text);
   }
-  const options = listRaw
-    .map((item, index): ParsedPromptOption | null => {
-      if (typeof item === 'string') {
-        const prompt = item.trim();
-        if (!prompt) return null;
-        return { title: `方案${index + 1}`, prompt };
-      }
-      if (!item || typeof item !== 'object') return null;
-      const row = item as Record<string, unknown>;
-      const title = String(row.title || row.name || row.label || `方案${index + 1}`).trim() || `方案${index + 1}`;
-      const prompt = String(row.prompt || row.content || row.text || '').trim();
-      if (!prompt) return null;
-      return { title, prompt };
-    })
-    .filter((item): item is ParsedPromptOption => Boolean(item))
-    .slice(0, 5);
-  if (options.length === 0) {
-    return parsePromptPackByRecovery(text);
-  }
-  const followUp = String(payload.follow_up || payload.followUp || '').trim();
-  return { options, followUp };
+  return parsePhase1OptionRows(listRaw, followUp) || parseLegacyPromptRows(listRaw, followUp);
 }
 
 function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
@@ -273,6 +386,33 @@ function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
 
     const status = normalizeTaskStatus(assistant?.status || current.status);
     const mode = normalizeMode(assistant?.mode || current.mode);
+    const attachments = current.attachments || [];
+    const references = Array.isArray(current.references)
+      ? current.references
+          .map((item, refIndex): ComposerReference | null => {
+            if (!item) return null;
+            const mentionId = normalizeText(item.mention_id) || `mention-${current.id}-${refIndex + 1}`;
+            const slot = normalizeText(item.slot);
+            const assetId = normalizeText(item.asset_id);
+            if (!slot || !assetId) return null;
+            const orderRaw = Number(item.order);
+            const order = Number.isFinite(orderRaw) && orderRaw > 0 ? orderRaw : refIndex + 1;
+            return {
+              mention_id: mentionId,
+              slot,
+              asset_id: assetId,
+              source: normalizeText(item.source),
+              order,
+              asset_title: normalizeText(item.asset_title),
+            };
+          })
+          .filter((item): item is ComposerReference => Boolean(item))
+      : [];
+    const attachmentAssetIds: string[] = [];
+    for (const aid of attachments.map((asset) => normalizeText(asset.id)).concat(references.map((item) => normalizeText(item.asset_id)))) {
+      if (!aid || attachmentAssetIds.includes(aid)) continue;
+      attachmentAssetIds.push(aid);
+    }
     tasks.push({
       id: current.id,
       mode,
@@ -280,7 +420,9 @@ function mergeMessagesToTasks(messages: StudioMessage[]): TaskItem[] {
       assistantText: assistant?.text || '',
       created_at: current.created_at || assistant?.created_at,
       params: current.params || assistant?.params,
-      attachments: current.attachments || [],
+      attachments,
+      attachmentAssetIds,
+      references,
       images: assistant?.images || current.images || [],
       status,
       runningText: status === 'running' ? assistant?.text || '正在生成中...' : '',
@@ -297,13 +439,15 @@ function TaskCard({
   onOpenAsset,
   onImageAction,
   onGenerateTextPromptImage,
+  onSelectTextPromptOption,
 }: {
   task: TaskItem;
   order: number;
   nowMs: number;
   onOpenAsset: (asset: StudioAsset) => void;
   onImageAction: (action: ImageAction, asset: StudioAsset) => void;
-  onGenerateTextPromptImage: (prompt: string) => void;
+  onGenerateTextPromptImage: (payload: TextPromptImageSelectionPayload) => void;
+  onSelectTextPromptOption: (payload: TextPromptOptionSelectionPayload) => void;
 }) {
   const metaItems = formatTaskMetaItems(task.params);
   const hasTextResult = task.mode === 'text' && Boolean((task.assistantText || '').trim());
@@ -312,7 +456,8 @@ function TaskCard({
   const runningText = task.status === 'running'
     ? buildRunningText(task.runningText || task.assistantText, task.created_at, nowMs)
     : '';
-  const isPromptPackTask = task.mode === 'text' && task.params?.prompt_pack_mode === 'five_image_prompts';
+  const promptPackMode = normalizeText(task.params?.prompt_pack_mode);
+  const isPromptPackTask = task.mode === 'text' && (promptPackMode === 'stepped_image_prompts' || promptPackMode === 'five_image_prompts');
   const parsedPromptPack = isPromptPackTask && task.status !== 'running' ? parsePromptPack(task.assistantText || '') : null;
 
   return (
@@ -466,33 +611,102 @@ function TaskCard({
                 </Typography>
               ) : parsedPromptPack ? (
                 <Stack spacing={0.8} sx={{ minWidth: 280 }}>
-                  {parsedPromptPack.options.map((item, index) => (
-                    <Box
-                      key={`${task.id}-prompt-pack-${index}`}
-                      sx={{
-                        borderRadius: 1.1,
-                        border: '1px solid rgba(0,0,0,0.09)',
-                        bgcolor: '#ffffff',
-                        p: 0.8,
-                      }}
-                    >
-                      <Stack direction="row" spacing={0.8} alignItems="center" justifyContent="space-between" sx={{ mb: 0.4 }}>
-                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#2e2a25' }}>
-                          {item.title || `方案${index + 1}`}
+                  {parsedPromptPack.phase === 'phase1_options' ? (
+                    <>
+                      {parsedPromptPack.anchors.length > 0 ? (
+                        <Typography variant="caption" sx={{ color: '#5f6a76' }}>
+                          结构锚点：{parsedPromptPack.anchors.join('；')}
                         </Typography>
-                        <Button
-                          size="small"
-                          onClick={() => onGenerateTextPromptImage(item.prompt)}
-                          sx={{ minWidth: 56, px: 1, py: 0.1, fontSize: 12, fontWeight: 700 }}
+                      ) : null}
+                      {parsedPromptPack.diagnosisPros.length > 0 ? (
+                        <Typography variant="caption" sx={{ color: '#5f6a76' }}>
+                          美学优点：{parsedPromptPack.diagnosisPros.join('；')}
+                        </Typography>
+                      ) : null}
+                      {parsedPromptPack.diagnosisCons.length > 0 ? (
+                        <Typography variant="caption" sx={{ color: '#5f6a76' }}>
+                          待优化：{parsedPromptPack.diagnosisCons.join('；')}
+                        </Typography>
+                      ) : null}
+                      {parsedPromptPack.options.map((item, index) => (
+                        <Box
+                          key={`${task.id}-prompt-pack-phase1-${item.id || index}`}
+                          sx={{
+                            borderRadius: 1.1,
+                            border: '1px solid rgba(0,0,0,0.09)',
+                            bgcolor: '#ffffff',
+                            p: 0.8,
+                          }}
                         >
-                          生图
-                        </Button>
-                      </Stack>
-                      <Typography variant="body2" sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.62 }}>
-                        {item.prompt}
-                      </Typography>
-                    </Box>
-                  ))}
+                          <Stack direction="row" spacing={0.8} alignItems="center" justifyContent="space-between" sx={{ mb: 0.4 }}>
+                            <Typography variant="caption" sx={{ fontWeight: 700, color: '#2e2a25' }}>
+                              {item.title || `方案${index + 1}`}
+                            </Typography>
+                            <Button
+                              size="small"
+                              onClick={() => onSelectTextPromptOption({
+                                sourceTaskId: task.id,
+                                sourceText: task.text,
+                                optionId: item.id || `opt${index + 1}`,
+                                title: item.title || `方案${index + 1}`,
+                                summary: item.summary,
+                                attachmentAssetIds: task.attachmentAssetIds,
+                                references: task.references,
+                              })}
+                              sx={{ minWidth: 78, px: 1, py: 0.1, fontSize: 12, fontWeight: 700 }}
+                            >
+                              选这个方案
+                            </Button>
+                          </Stack>
+                          <Typography variant="body2" sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.62 }}>
+                            {item.summary}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </>
+                  ) : (
+                    <>
+                      {parsedPromptPack.selectedOptionTitle ? (
+                        <Typography variant="caption" sx={{ color: '#5f6a76' }}>
+                          已选方案：{parsedPromptPack.selectedOptionTitle}
+                        </Typography>
+                      ) : null}
+                      {parsedPromptPack.prompts.map((item, index) => (
+                        <Box
+                          key={`${task.id}-prompt-pack-phase2-${item.id || index}`}
+                          sx={{
+                            borderRadius: 1.1,
+                            border: '1px solid rgba(0,0,0,0.09)',
+                            bgcolor: '#ffffff',
+                            p: 0.8,
+                          }}
+                        >
+                          <Stack direction="row" spacing={0.8} alignItems="center" justifyContent="space-between" sx={{ mb: 0.4 }}>
+                            <Typography variant="caption" sx={{ fontWeight: 700, color: '#2e2a25' }}>
+                              {item.title || `提示词${index + 1}`}
+                            </Typography>
+                            <Button
+                              size="small"
+                              onClick={() =>
+                                onGenerateTextPromptImage({
+                                  sourceTaskId: task.id,
+                                  prompt: item.prompt,
+                                  attachmentAssetIds: task.attachmentAssetIds,
+                                  references: task.references,
+                                })
+                              }
+                              sx={{ minWidth: 56, px: 1, py: 0.1, fontSize: 12, fontWeight: 700 }}
+                            >
+                              生图
+                            </Button>
+                          </Stack>
+                          <Typography variant="body2" sx={{ color: '#2e2a25', whiteSpace: 'pre-wrap', lineHeight: 1.62 }}>
+                            {item.prompt}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </>
+                  )}
                   {parsedPromptPack.followUp ? (
                     <Typography variant="caption" sx={{ color: '#5f6a76' }}>
                       {parsedPromptPack.followUp}
@@ -656,7 +870,7 @@ function TaskCard({
   );
 }
 
-export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTextPromptImage }: ChatThreadProps) {
+export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTextPromptImage, onSelectTextPromptOption }: ChatThreadProps) {
   const messages = workspace?.messages;
   const tasks = useMemo(() => mergeMessagesToTasks(messages || []), [messages]);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -701,6 +915,7 @@ export function ChatThread({ workspace, onOpenAsset, onImageAction, onGenerateTe
             onOpenAsset={onOpenAsset}
             onImageAction={onImageAction}
             onGenerateTextPromptImage={onGenerateTextPromptImage}
+            onSelectTextPromptOption={onSelectTextPromptOption}
           />
         ))}
       </Stack>

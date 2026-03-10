@@ -68,6 +68,35 @@ const DEFAULT_API_CONFIG: RuntimeConfig = {
     timeout_seconds: 120,
     download_dir: '',
   },
+  stepped_prompt: {
+    phase1_template: [
+      '你是“全案室内设计大师（20年高品质私宅落地经验）”。',
+      '请先做结构锚定分析，再做美学诊断，然后给出改造选项。',
+      '严格保留原始硬装结构，不得拆改门窗、吊顶、管线、地面铺贴与动线。',
+      '拒绝网红化和不宜居风格，只推荐主流高级、可落地的居住风格。',
+      '你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。',
+      '固定 JSON 结构：',
+      '{"type":"interior_two_stage_v1","phase":"phase1_options","anchors":["..."],"diagnosis":{"pros":["..."],"cons":["..."]},"options":[{"id":"opt1","title":"风格名","summary":"方案摘要"}],"follow_up":"请从3个方案中选择一个，我将生成3条可直接生图提示词。"}。',
+      '其中 options 必须严格为 3 项；每项都要明显不同，禁止同义改写。',
+    ].join('\n'),
+    phase2_template: [
+      '你是“全案室内设计大师（20年高品质私宅落地经验）”。',
+      '用户已选择方案：{{selected_option_title}}（{{selected_option_id}}）。',
+      '方案摘要：{{selected_option_summary}}。',
+      '请基于该方案生成 3 条可直接用于生图模型的中文长提示词。',
+      '每条提示词都必须包含：',
+      '1) 正向描述（风格、材质、光影、家具形态、镜头视角、画质关键词）；',
+      '2) 核心约束（保持原有房间结构不变，保持门窗位置不变，保持吊顶造型不变，保持透视关系）；',
+      '3) 负向描述（不要改变户型，不要拆墙，避免样板间式冰冷感，避免过度概念化）。',
+      '必须包含关键词：温馨舒适、高档居住氛围、生活气息、AD家居杂志摄影、真实质感、光影层次、色温3000K-4000K（暖白光）、8k超高清真实摄影。',
+      '材质必须具体，如全粒面皮革、哑光胡桃木、棉麻窗帘。',
+      '三条提示词必须显著不同，禁止同义改写。',
+      '你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。',
+      '固定 JSON 结构：',
+      '{"type":"interior_two_stage_v1","phase":"phase2_prompts","selected_option":{"id":"optX","title":"风格名"},"prompts":[{"id":"p1","title":"提示词1","prompt":"完整中文长提示词"}],"follow_up":"可直接点击任意“生图”生成。"}。',
+      '其中 prompts 必须严格为 3 项；每条都必须是可直接生图的完整中文长句。',
+    ].join('\n'),
+  },
 };
 
 const DEFAULT_MENTION_SETTINGS: MentionSettings = {
@@ -96,6 +125,8 @@ function normalizeSourceContentType(value: unknown): MentionSourceContentType {
 
 function normalizeRuntime(input: RuntimeConfig): RuntimeConfig {
   const timeout = Number.isFinite(input.http.timeout_seconds) ? Number(input.http.timeout_seconds) : 120;
+  const phase1Template = String(input.stepped_prompt?.phase1_template || '').trim();
+  const phase2Template = String(input.stepped_prompt?.phase2_template || '').trim();
   return {
     http: {
       endpoint: input.http.endpoint.trim(),
@@ -107,6 +138,10 @@ function normalizeRuntime(input: RuntimeConfig): RuntimeConfig {
       response_format: input.http.response_format === 'b64_json' ? 'b64_json' : 'url',
       timeout_seconds: Math.max(5, Math.min(Math.round(timeout), 600)),
       download_dir: String(input.http.download_dir || '').trim(),
+    },
+    stepped_prompt: {
+      phase1_template: phase1Template || DEFAULT_API_CONFIG.stepped_prompt.phase1_template,
+      phase2_template: phase2Template || DEFAULT_API_CONFIG.stepped_prompt.phase2_template,
     },
   };
 }
@@ -801,6 +836,57 @@ export function ApiSettingsDialog({
                 {selectingDirectory ? '选择中...' : '选择目录'}
               </Button>
             </Stack>
+
+            <Box
+              sx={{
+                border: '1px solid',
+                borderColor: 'divider',
+                borderRadius: 1.2,
+                p: 1,
+                bgcolor: 'rgba(0,0,0,0.015)',
+              }}
+            >
+              <Typography variant="subtitle2" sx={{ mb: 0.8 }}>
+                分步生图词模板（可编辑）
+              </Typography>
+              <Stack spacing={1}>
+                <TextField
+                  label="阶段1模板（出3个方案）"
+                  value={apiDraft.stepped_prompt.phase1_template}
+                  onChange={(event) =>
+                    setApiDraft((prev) => ({
+                      ...prev,
+                      stepped_prompt: {
+                        ...prev.stepped_prompt,
+                        phase1_template: event.target.value,
+                      },
+                    }))
+                  }
+                  multiline
+                  minRows={8}
+                  fullWidth
+                />
+                <TextField
+                  label="阶段2模板（出3条生图词）"
+                  value={apiDraft.stepped_prompt.phase2_template}
+                  onChange={(event) =>
+                    setApiDraft((prev) => ({
+                      ...prev,
+                      stepped_prompt: {
+                        ...prev.stepped_prompt,
+                        phase2_template: event.target.value,
+                      },
+                    }))
+                  }
+                  multiline
+                  minRows={10}
+                  fullWidth
+                />
+                <Typography variant="caption" color="text.secondary">
+                  {'阶段2支持变量：{{selected_option_id}}、{{selected_option_title}}、{{selected_option_summary}}。'}
+                </Typography>
+              </Stack>
+            </Box>
 
             {apiError ? <Alert severity="error">{apiError}</Alert> : null}
           </Stack>

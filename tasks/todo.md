@@ -259,3 +259,19 @@
 - 验证结果：
   - `PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile backend/service.py backend/main.py` 通过
   - `npm --prefix frontend run build` 通过
+
+# Text分步生图模板可编辑+第三步带原图 (2026-03-10)
+
+- [x] 后端 runtime_config 增加 stepped_prompt 两阶段模板配置并完成流式注入
+- [x] 前端 API 设置增加两段模板可见可编辑并保存
+- [x] phase2 “生图”按钮携带原参考图（attachment/references）一起发请求
+- [x] 前后端编译验证
+- [x] 任务复盘与 lessons 补充
+
+## Review
+- 后端 `runtime_config` 新增 `stepped_prompt.phase1_template/phase2_template`，并在 text 分步模式下按阶段注入模板；阶段2支持 `{{selected_option_*}}` 变量替换。
+- API 设置新增“分步生图词模板（可编辑）”区块，用户可直接查看并修改两阶段模板内容。
+- phase2 返回的每条提示词点击“生图”时，会透传该任务携带的 `attachment_asset_ids + references`，确保原参考图与文字提示词一并提交到生图请求。
+- 验证结果：
+  - `PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile backend/main.py backend/service.py` 通过
+  - `npm --prefix frontend run build` 通过

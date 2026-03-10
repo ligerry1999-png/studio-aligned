@@ -56,8 +56,14 @@ class RuntimeHttpConfigRequest(BaseModel):
     download_dir: str = Field(default="")
 
 
+class RuntimeSteppedPromptConfigRequest(BaseModel):
+    phase1_template: str = Field(default="")
+    phase2_template: str = Field(default="")
+
+
 class RuntimeConfigRequest(BaseModel):
     http: RuntimeHttpConfigRequest = Field(default_factory=RuntimeHttpConfigRequest)
+    stepped_prompt: RuntimeSteppedPromptConfigRequest = Field(default_factory=RuntimeSteppedPromptConfigRequest)
 
 
 class UpdateWorkspaceModeRequest(BaseModel):
@@ -155,10 +161,43 @@ PROTECTED_MENTION_SOURCE_IDS = {"upload", "generated", "saved"}
 # 为降低并发下的瞬时网络失败，允许有限次重试；仅瞬时网络错误会进入重试分支。
 HTTP_GENERATE_MAX_ATTEMPTS = 3
 TEXT_STREAM_TRANSIENT_MAX_RETRIES = 2
-TEXT_PROMPT_PACK_MODE = "five_image_prompts"
+TEXT_PROMPT_PACK_TIMEOUT_SECONDS = 90
+TEXT_PROMPT_PACK_MODE = "stepped_image_prompts"
+TEXT_PROMPT_PACK_MODE_LEGACY = "five_image_prompts"
+TEXT_PROMPT_PACK_STAGE_PHASE1 = "phase1_options"
+TEXT_PROMPT_PACK_STAGE_PHASE2 = "phase2_prompts"
 WORKFLOW_RUN_MAX_TASKS = 50
 WORKFLOW_PRIMARY_ASSET_MENTIONS = {"input_asset", "主素材"}
 WORKFLOW_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_\u4e00-\u9fff]+)")
+
+DEFAULT_STEPPED_PROMPT_PHASE1_TEMPLATE = """
+你是“全案室内设计大师（20年高品质私宅落地经验）”。
+请先做结构锚定分析，再做美学诊断，然后给出改造选项。
+严格保留原始硬装结构，不得拆改门窗、吊顶、管线、地面铺贴与动线。
+拒绝网红化和不宜居风格，只推荐主流高级、可落地的居住风格。
+你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。
+固定 JSON 结构：
+{"type":"interior_two_stage_v1","phase":"phase1_options","anchors":["..."],"diagnosis":{"pros":["..."],"cons":["..."]},"options":[{"id":"opt1","title":"风格名","summary":"方案摘要"}],"follow_up":"请从3个方案中选择一个，我将生成3条可直接生图提示词。"}。
+其中 options 必须严格为 3 项；每项都要明显不同，禁止同义改写。
+""".strip()
+
+DEFAULT_STEPPED_PROMPT_PHASE2_TEMPLATE = """
+你是“全案室内设计大师（20年高品质私宅落地经验）”。
+用户已选择方案：{{selected_option_title}}（{{selected_option_id}}）。
+方案摘要：{{selected_option_summary}}。
+请基于该方案生成 3 条可直接用于生图模型的中文长提示词。
+每条提示词都必须包含：
+1) 正向描述（风格、材质、光影、家具形态、镜头视角、画质关键词）；
+2) 核心约束（保持原有房间结构不变，保持门窗位置不变，保持吊顶造型不变，保持透视关系）；
+3) 负向描述（不要改变户型，不要拆墙，避免样板间式冰冷感，避免过度概念化）。
+必须包含关键词：温馨舒适、高档居住氛围、生活气息、AD家居杂志摄影、真实质感、光影层次、色温3000K-4000K（暖白光）、8k超高清真实摄影。
+材质必须具体，如全粒面皮革、哑光胡桃木、棉麻窗帘。
+三条提示词必须显著不同，禁止同义改写。
+你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。
+固定 JSON 结构：
+{"type":"interior_two_stage_v1","phase":"phase2_prompts","selected_option":{"id":"optX","title":"风格名"},"prompts":[{"id":"p1","title":"提示词1","prompt":"完整中文长提示词"}],"follow_up":"可直接点击任意“生图”生成。"}。
+其中 prompts 必须严格为 3 项；每条都必须是可直接生图的完整中文长句。
+""".strip()
 
 DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
     "http": {
@@ -169,6 +208,10 @@ DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
         "response_format": "url",
         "timeout_seconds": 120,
         "download_dir": "",
+    },
+    "stepped_prompt": {
+        "phase1_template": DEFAULT_STEPPED_PROMPT_PHASE1_TEMPLATE,
+        "phase2_template": DEFAULT_STEPPED_PROMPT_PHASE2_TEMPLATE,
     },
 }
 
@@ -289,6 +332,21 @@ def _normalize_composer_mode(mode: Any) -> str:
     return "image"
 
 
+def _normalize_stepped_prompt_config(payload: Any) -> Dict[str, str]:
+    default_payload = {
+        "phase1_template": DEFAULT_STEPPED_PROMPT_PHASE1_TEMPLATE,
+        "phase2_template": DEFAULT_STEPPED_PROMPT_PHASE2_TEMPLATE,
+    }
+    if not isinstance(payload, dict):
+        return dict(default_payload)
+    phase1 = str(payload.get("phase1_template") or "").strip()
+    phase2 = str(payload.get("phase2_template") or "").strip()
+    return {
+        "phase1_template": phase1 or default_payload["phase1_template"],
+        "phase2_template": phase2 or default_payload["phase2_template"],
+    }
+
+
 def _normalize_runtime_config(payload: Any) -> Dict[str, Any]:
     cfg = {
         "http": {
@@ -300,6 +358,7 @@ def _normalize_runtime_config(payload: Any) -> Dict[str, Any]:
             "timeout_seconds": 120,
             "download_dir": "",
         },
+        "stepped_prompt": _normalize_stepped_prompt_config(None),
     }
     if not isinstance(payload, dict):
         return cfg
@@ -319,6 +378,8 @@ def _normalize_runtime_config(payload: Any) -> Dict[str, Any]:
             timeout = 120
         cfg["http"]["timeout_seconds"] = max(5, min(timeout, 600))
         cfg["http"]["download_dir"] = str(http_payload.get("download_dir") or "").strip()
+
+    cfg["stepped_prompt"] = _normalize_stepped_prompt_config(payload.get("stepped_prompt"))
 
     return cfg
 
@@ -344,17 +405,67 @@ def _normalize_source_content_type(value: Any) -> str:
 
 
 def _normalize_prompt_pack_mode(value: Any) -> str:
-    return TEXT_PROMPT_PACK_MODE if str(value or "").strip().lower() == TEXT_PROMPT_PACK_MODE else ""
+    normalized = str(value or "").strip().lower()
+    if normalized in {TEXT_PROMPT_PACK_MODE, TEXT_PROMPT_PACK_MODE_LEGACY}:
+        return TEXT_PROMPT_PACK_MODE
+    return ""
 
 
-def _five_prompt_json_instruction() -> str:
-    return (
-        "请基于用户输入生成 5 条可直接用于室内设计生图的中文提示词方案。"
-        "你必须且只能返回 JSON，不要 Markdown，不要解释，不要前后缀。"
-        "JSON 结构固定为："
-        '{"options":[{"title":"方案名","prompt":"可直接生图的完整提示词"}],"follow_up":"一句中文引导用户选择的问题"}。'
-        "其中 options 必须严格为 5 项；每个 prompt 要具体、可执行、风格清晰。"
-    )
+def _normalize_prompt_pack_stage(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == TEXT_PROMPT_PACK_STAGE_PHASE2:
+        return TEXT_PROMPT_PACK_STAGE_PHASE2
+    return TEXT_PROMPT_PACK_STAGE_PHASE1
+
+
+def _normalize_prompt_pack_selected_option(params: Any) -> Dict[str, str]:
+    if not isinstance(params, dict):
+        return {}
+    nested = params.get("selected_option")
+    option_id = str(params.get("selected_option_id") or "").strip()
+    option_title = str(params.get("selected_option_title") or "").strip()
+    option_summary = str(params.get("selected_option_summary") or "").strip()
+    if isinstance(nested, dict):
+        option_id = str(nested.get("id") or option_id).strip()
+        option_title = str(nested.get("title") or option_title).strip()
+        option_summary = str(nested.get("summary") or option_summary).strip()
+    payload: Dict[str, str] = {}
+    if option_id:
+        payload["id"] = option_id
+    if option_title:
+        payload["title"] = option_title
+    if option_summary:
+        payload["summary"] = option_summary
+    return payload
+
+
+def _render_prompt_template(template: str, variables: Dict[str, str]) -> str:
+    result = str(template or "")
+    for key, value in variables.items():
+        token = f"{{{{{key}}}}}"
+        result = result.replace(token, str(value or ""))
+    return result.strip()
+
+
+def _stepped_prompt_json_instruction(stage: str, selected_option: Dict[str, str], prompt_config: Dict[str, Any]) -> str:
+    normalized_prompt_config = _normalize_stepped_prompt_config(prompt_config)
+    option_id = str(selected_option.get("id") or "").strip() or "optX"
+    option_title = str(selected_option.get("title") or "").strip() or "已选方案"
+    option_summary = str(selected_option.get("summary") or "").strip() or "（未提供摘要）"
+    option_context = f"{option_title}（{option_id}）"
+    if option_summary:
+        option_context = f"{option_context}；摘要：{option_summary}"
+    variables = {
+        "selected_option_id": option_id,
+        "selected_option_title": option_title,
+        "selected_option_summary": option_summary,
+        "selected_option_context": option_context,
+    }
+    if stage == TEXT_PROMPT_PACK_STAGE_PHASE2:
+        template = normalized_prompt_config["phase2_template"]
+        return _render_prompt_template(template, variables)
+    template = normalized_prompt_config["phase1_template"]
+    return _render_prompt_template(template, variables)
 
 
 def _normalize_source_item(item: Any, index: int, source_content_type: str = "image") -> Dict[str, Any]:
@@ -1796,6 +1907,7 @@ class StudioService:
     def _resolve_text_runtime(self) -> Dict[str, Any]:
         config = self.get_runtime_config()
         http_cfg = config.get("http") if isinstance(config.get("http"), dict) else {}
+        stepped_prompt_cfg = config.get("stepped_prompt") if isinstance(config.get("stepped_prompt"), dict) else {}
         chat_endpoint = self._normalize_chat_endpoint(str(http_cfg.get("endpoint") or ""))
         if not chat_endpoint:
             raise HTTPException(status_code=400, detail="请先在设置中填写 API 地址。")
@@ -1812,6 +1924,7 @@ class StudioService:
             "timeout_seconds": timeout_seconds,
             "api_key": api_key,
             "model": text_model,
+            "stepped_prompt": _normalize_stepped_prompt_config(stepped_prompt_cfg),
         }
 
     def _content_node_to_text(self, content: Any) -> str:
@@ -2369,7 +2482,10 @@ class StudioService:
             raise HTTPException(status_code=404, detail="Workspace not found")
 
         runtime = self._resolve_text_runtime()
-        prompt_pack_mode = _normalize_prompt_pack_mode((params or {}).get("prompt_pack_mode"))
+        raw_params = params or {}
+        prompt_pack_mode = _normalize_prompt_pack_mode(raw_params.get("prompt_pack_mode"))
+        prompt_pack_stage = _normalize_prompt_pack_stage(raw_params.get("prompt_pack_stage"))
+        selected_option = _normalize_prompt_pack_selected_option(raw_params)
         valid_references: List[Dict[str, Any]] = []
         seen_slots: set = set()
         for idx, ref in enumerate(references or []):
@@ -2425,7 +2541,11 @@ class StudioService:
             else:
                 composed_text = annotation_prompt
         if prompt_pack_mode == TEXT_PROMPT_PACK_MODE:
-            structure_instruction = _five_prompt_json_instruction()
+            structure_instruction = _stepped_prompt_json_instruction(
+                prompt_pack_stage,
+                selected_option,
+                runtime.get("stepped_prompt"),
+            )
             if composed_text:
                 composed_text = f"{composed_text}\n\n[输出格式要求]\n{structure_instruction}"
             else:
@@ -2439,6 +2559,13 @@ class StudioService:
         }
         if prompt_pack_mode:
             normalized_params["prompt_pack_mode"] = prompt_pack_mode
+            normalized_params["prompt_pack_stage"] = prompt_pack_stage
+            if selected_option.get("id"):
+                normalized_params["selected_option_id"] = selected_option["id"]
+            if selected_option.get("title"):
+                normalized_params["selected_option_title"] = selected_option["title"]
+            if selected_option.get("summary"):
+                normalized_params["selected_option_summary"] = selected_option["summary"]
         user_msg = {
             "id": f"msg-{uuid.uuid4().hex[:10]}",
             "role": "user",
@@ -2517,7 +2644,16 @@ class StudioService:
                 if multimodal_data_urls and "linkapi.org" in endpoint:
                     style_attempts = ["string", "object"]
 
-                timeout_seconds = int(runtime.get("timeout_seconds") or 120)
+                try:
+                    timeout_seconds = int(runtime.get("timeout_seconds") or 120)
+                except Exception:
+                    timeout_seconds = 120
+                timeout_seconds = max(5, min(timeout_seconds, 600))
+                transient_max_retries = TEXT_STREAM_TRANSIENT_MAX_RETRIES
+                # 分步生图词强调交互速度，限制超时并关闭自动重试，避免一次任务长时间挂起。
+                if prompt_pack_mode == TEXT_PROMPT_PACK_MODE:
+                    timeout_seconds = min(timeout_seconds, TEXT_PROMPT_PACK_TIMEOUT_SECONDS)
+                    transient_max_retries = 0
                 style_succeeded = False
                 for attempt_index, style in enumerate(style_attempts):
                     transient_retry_count = 0
@@ -2554,7 +2690,7 @@ class StudioService:
                             if (
                                 not attempt_has_delta
                                 and not accumulated
-                                and transient_retry_count < TEXT_STREAM_TRANSIENT_MAX_RETRIES
+                                and transient_retry_count < transient_max_retries
                                 and self._is_transient_text_upstream_error(detail)
                             ):
                                 transient_retry_count += 1

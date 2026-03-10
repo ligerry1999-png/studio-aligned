@@ -13,7 +13,12 @@ import { Link as RouterLink } from 'react-router-dom';
 import { studioApi, resolveAssetUrl } from '../api/client';
 import { AnnotatorDialog, type AnnotationDraftContext } from '../components/AnnotatorDialog';
 import { ApiSettingsDialog } from '../components/ApiSettingsDialog';
-import { ChatThread, type ImageAction } from '../components/ChatThread';
+import {
+  ChatThread,
+  type ImageAction,
+  type TextPromptImageSelectionPayload,
+  type TextPromptOptionSelectionPayload,
+} from '../components/ChatThread';
 import { ComposerDock, type InsertAssetRequest } from '../components/ComposerDock';
 import { ImageLightbox } from '../components/ImageLightbox';
 import type { OfficialFilters } from '../components/ComposerDock';
@@ -880,17 +885,41 @@ export function StudioPage() {
     const pendingTurns = pendingTurnsByWorkspace[currentWorkspace.id] || [];
     if (pendingTurns.length === 0) return [];
     const nowMs = progressNowMs;
+    const workspaceMessages = currentWorkspace.messages || [];
+    const hasPersistedCounterpart = (turn: PendingTurn): boolean => {
+      const targetText = String(turn.text || '').trim();
+      const targetMode = turn.mode;
+      if (!targetText) return false;
+      for (let index = 0; index < workspaceMessages.length; index += 1) {
+        const userMsg = workspaceMessages[index];
+        if (!userMsg || userMsg.role !== 'user') continue;
+        if ((userMsg.mode || 'image') !== targetMode) continue;
+        if (String(userMsg.text || '').trim() !== targetText) continue;
+        const assistantMsg = workspaceMessages[index + 1];
+        if (!assistantMsg || assistantMsg.role !== 'assistant') continue;
+        if ((assistantMsg.mode || 'image') !== targetMode) continue;
+        const status = String(assistantMsg.status || '').trim().toLowerCase();
+        if (status === 'running' || status === 'completed' || status === 'failed') {
+          return true;
+        }
+      }
+      return false;
+    };
     return pendingTurns.flatMap((turn) => {
+      if (hasPersistedCounterpart(turn)) {
+        return [];
+      }
       const parsedCreatedAtMs = Date.parse(turn.createdAt);
       const createdAtMs = Number.isFinite(parsedCreatedAtMs) ? parsedCreatedAtMs : nowMs;
       const runningSinceMs = turn.startedAtMs ?? createdAtMs;
       const elapsedSeconds = Math.max(1, Math.floor((nowMs - runningSinceMs) / 1000));
-      const assistantText = `正在生成中... 已耗时 ${elapsedSeconds}s`;
+      const runningPrefix = turn.mode === 'text' ? '正在思考中' : '正在生成中';
+      const assistantText = `${runningPrefix}... 已耗时 ${elapsedSeconds}s`;
       return [
         {
           id: `${turn.id}-user`,
           role: 'user',
-          mode: 'image',
+          mode: turn.mode,
           text: turn.text,
           params: turn.params,
           status: 'pending',
@@ -899,7 +928,7 @@ export function StudioPage() {
         {
           id: `${turn.id}-assistant`,
           role: 'assistant',
-          mode: 'image',
+          mode: turn.mode,
           text: assistantText,
           params: turn.params,
           status: 'running',
@@ -1298,6 +1327,22 @@ export function StudioPage() {
       }));
 
     if (composerMode === 'text') {
+      const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      const pendingTurn: PendingTurn = {
+        id: pendingId,
+        workspaceId: targetWorkspaceId,
+        mode: 'text',
+        text,
+        params: { ...params },
+        createdAt: new Date().toISOString(),
+        startedAtMs: Date.now(),
+        status: 'running',
+      };
+      setPendingTurnsByWorkspace((prev) => ({
+        ...prev,
+        [targetWorkspaceId]: (prev[targetWorkspaceId] || []).concat(pendingTurn),
+      }));
+
       setComposerText('');
       setComposerReferences([]);
       setAnnotationContextsByMention({});
@@ -1310,7 +1355,7 @@ export function StudioPage() {
       adjustWorkspaceTextStreamingCount(targetWorkspaceId, 1);
       try {
         const textTurnParams: GenerationParams = textPromptPackEnabled
-          ? { ...params, prompt_pack_mode: 'five_image_prompts' }
+          ? { ...params, prompt_pack_mode: 'stepped_image_prompts', prompt_pack_stage: 'phase1_options' }
           : { ...params };
         await studioApi.createTextTurnStream(
           targetWorkspaceId,
@@ -1323,6 +1368,7 @@ export function StudioPage() {
           },
           {
             onStart: (event) => {
+              removePendingTurn(targetWorkspaceId, pendingId);
               assistantMessageId = event.assistant_message.id;
               patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
                 const messages = [...workspace.messages];
@@ -1427,6 +1473,7 @@ export function StudioPage() {
         }
       } finally {
         adjustWorkspaceTextStreamingCount(targetWorkspaceId, -1);
+        removePendingTurn(targetWorkspaceId, pendingId);
       }
       return;
     }
@@ -1463,14 +1510,33 @@ export function StudioPage() {
     void runImageTurn(targetWorkspaceId, pendingId, requestPayload);
   }
 
-  function handleGenerateImageFromTextPrompt(promptText: string) {
+  function handleGenerateImageFromTextPrompt(payload: TextPromptImageSelectionPayload) {
     const workspaceId = currentWorkspaceIdRef.current;
-    const normalizedPrompt = String(promptText || '').trim();
+    const normalizedPrompt = String(payload.prompt || '').trim();
     if (!workspaceId) return;
     if (!normalizedPrompt) {
       showToast('提示词为空，无法生图', 'error');
       return;
     }
+    const normalizedReferences = Array.isArray(payload.references)
+      ? payload.references.map((item) => ({
+          mention_id: String(item.mention_id || '').trim(),
+          slot: String(item.slot || '').trim(),
+          asset_id: String(item.asset_id || '').trim(),
+          source: String(item.source || '').trim(),
+          order: Number(item.order || 0) || undefined,
+          asset_title: String(item.asset_title || '').trim(),
+        })).filter((item) => item.mention_id && item.slot && item.asset_id)
+      : [];
+    const normalizedAttachmentIds = Array.isArray(payload.attachmentAssetIds)
+      ? payload.attachmentAssetIds.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const dedupedAttachmentIds: string[] = [];
+    for (const aid of normalizedReferences.map((item) => item.asset_id).concat(normalizedAttachmentIds)) {
+      if (!aid || dedupedAttachmentIds.includes(aid)) continue;
+      dedupedAttachmentIds.push(aid);
+    }
+
     const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const pendingTurn: PendingTurn = {
       id: pendingId,
@@ -1489,12 +1555,189 @@ export function StudioPage() {
     const requestPayload: ImageTurnRequest = {
       text: normalizedPrompt,
       params: { ...params },
-      attachmentIds: [],
-      references: [],
+      attachmentIds: dedupedAttachmentIds,
+      references: normalizedReferences,
       annotationPayloads: [],
     };
     void runImageTurn(workspaceId, pendingId, requestPayload);
-    showToast('已开始生图任务');
+    showToast(dedupedAttachmentIds.length > 0 ? '已开始生图任务（已带上原参考图）' : '已开始生图任务');
+  }
+
+  async function handleSelectTextPromptOption(payload: TextPromptOptionSelectionPayload) {
+    const targetWorkspaceId = currentWorkspaceIdRef.current;
+    if (!targetWorkspaceId) return;
+    const optionId = String(payload.optionId || '').trim() || 'optX';
+    const optionTitle = String(payload.title || '').trim() || '已选方案';
+    const optionSummary = String(payload.summary || '').trim();
+    const sourceText = String(payload.sourceText || '').trim();
+    const composedText = [
+      `用户选择了改造方案：${optionTitle}（${optionId}）`,
+      optionSummary ? `方案摘要：${optionSummary}` : '',
+      sourceText ? `原始需求：${sourceText}` : '',
+      '请继续生成3条可直接生图的提示词。',
+    ]
+      .filter(Boolean)
+      .join('\n');
+    const textTurnParams: GenerationParams = {
+      ...params,
+      prompt_pack_mode: 'stepped_image_prompts',
+      prompt_pack_stage: 'phase2_prompts',
+      selected_option_id: optionId,
+      selected_option_title: optionTitle,
+      selected_option_summary: optionSummary,
+    };
+    const attachmentAssetIds = Array.isArray(payload.attachmentAssetIds)
+      ? payload.attachmentAssetIds.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const references = Array.isArray(payload.references)
+      ? payload.references.map((item) => ({
+          mention_id: String(item.mention_id || '').trim(),
+          slot: String(item.slot || '').trim(),
+          asset_id: String(item.asset_id || '').trim(),
+          source: String(item.source || '').trim(),
+          order: Number(item.order || 0) || undefined,
+          asset_title: String(item.asset_title || '').trim(),
+        })).filter((item) => item.mention_id && item.slot && item.asset_id)
+      : [];
+
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const pendingTurn: PendingTurn = {
+      id: pendingId,
+      workspaceId: targetWorkspaceId,
+      mode: 'text',
+      text: composedText,
+      params: { ...textTurnParams },
+      createdAt: new Date().toISOString(),
+      startedAtMs: Date.now(),
+      status: 'running',
+    };
+    setPendingTurnsByWorkspace((prev) => ({
+      ...prev,
+      [targetWorkspaceId]: (prev[targetWorkspaceId] || []).concat(pendingTurn),
+    }));
+
+    let assistantMessageId = '';
+    let streamErrorMessage = '';
+    adjustWorkspaceTextStreamingCount(targetWorkspaceId, 1);
+    try {
+      await studioApi.createTextTurnStream(
+        targetWorkspaceId,
+        {
+          text: composedText,
+          params: textTurnParams,
+          attachment_asset_ids: attachmentAssetIds,
+          references,
+          annotation_contexts: [],
+        },
+        {
+          onStart: (event) => {
+            removePendingTurn(targetWorkspaceId, pendingId);
+            assistantMessageId = event.assistant_message.id;
+            patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+              const messages = [...workspace.messages];
+              const upsert = (message: StudioMessage) => {
+                const idx = messages.findIndex((item) => item.id === message.id);
+                if (idx >= 0) {
+                  messages[idx] = { ...messages[idx], ...message };
+                } else {
+                  messages.push(message);
+                }
+              };
+              upsert(event.user_message);
+              upsert(event.assistant_message);
+              return {
+                ...workspace,
+                messages,
+                updated_at: new Date().toISOString(),
+              };
+            });
+          },
+          onDelta: (event) => {
+            if (!assistantMessageId) return;
+            patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => ({
+              ...workspace,
+              messages: workspace.messages.map((message) =>
+                message.id === assistantMessageId
+                  ? { ...message, text: event.assistant_text || `${message.text || ''}${event.delta || ''}`, status: 'running' }
+                  : message,
+              ),
+              updated_at: new Date().toISOString(),
+            }));
+          },
+          onDone: (event) => {
+            patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+              const messages = [...workspace.messages];
+              const upsert = (message: StudioMessage) => {
+                const idx = messages.findIndex((item) => item.id === message.id);
+                if (idx >= 0) {
+                  messages[idx] = { ...messages[idx], ...message };
+                } else {
+                  messages.push(message);
+                }
+              };
+              upsert(event.user_message);
+              upsert(event.assistant_message);
+              return {
+                ...workspace,
+                messages,
+                updated_at: new Date().toISOString(),
+              };
+            });
+          },
+          onError: (event) => {
+            streamErrorMessage = event.message || '文本生成失败';
+            patchWorkspaceIfCurrent(targetWorkspaceId, (workspace) => {
+              const messages = workspace.messages.map((message) => {
+                if (event.assistant_message && message.id === event.assistant_message.id) {
+                  return { ...message, ...event.assistant_message };
+                }
+                if (!event.assistant_message && assistantMessageId && message.id === assistantMessageId) {
+                  return {
+                    ...message,
+                    status: 'failed',
+                    text: `文本生成失败：${streamErrorMessage}`,
+                  };
+                }
+                return message;
+              });
+              return {
+                ...workspace,
+                messages,
+                updated_at: new Date().toISOString(),
+              };
+            });
+          },
+        },
+      );
+      try {
+        await refreshSessions();
+        await refreshDynamicSourceAssets();
+        if (currentWorkspaceIdRef.current === targetWorkspaceId) {
+          await loadWorkspace(targetWorkspaceId);
+        }
+      } catch {
+        // 文本回复完成后的刷新失败不阻塞主流程
+      }
+      if (streamErrorMessage) {
+        showToast(streamErrorMessage, 'error');
+      } else {
+        showToast(`已按“${optionTitle}”生成 3 条生图提示词`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '文本生成失败';
+      showToast(message, 'error');
+      try {
+        if (currentWorkspaceIdRef.current === targetWorkspaceId) {
+          await loadWorkspace(targetWorkspaceId);
+        }
+        await refreshSessions();
+      } catch {
+        // 失败态刷新异常时不阻塞提示
+      }
+    } finally {
+      adjustWorkspaceTextStreamingCount(targetWorkspaceId, -1);
+      removePendingTurn(targetWorkspaceId, pendingId);
+    }
   }
 
   async function reloadCurrentWorkspace() {
@@ -1725,8 +1968,11 @@ export function StudioPage() {
                     onImageAction={(action, asset) => {
                       void handleImageAction(action, asset);
                     }}
-                    onGenerateTextPromptImage={(prompt) => {
-                      handleGenerateImageFromTextPrompt(prompt);
+                    onGenerateTextPromptImage={(payload) => {
+                      handleGenerateImageFromTextPrompt(payload);
+                    }}
+                    onSelectTextPromptOption={(payload) => {
+                      void handleSelectTextPromptOption(payload);
                     }}
                   />
                 </Box>

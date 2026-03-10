@@ -25,8 +25,14 @@ export interface RuntimeHttpConfig {
   download_dir: string;
 }
 
+export interface RuntimeSteppedPromptConfig {
+  phase1_template: string;
+  phase2_template: string;
+}
+
 export interface RuntimeConfig {
   http: RuntimeHttpConfig;
+  stepped_prompt: RuntimeSteppedPromptConfig;
 }
 
 export interface MentionSourceItem {
@@ -65,7 +71,11 @@ export interface GenerationParams {
   aspect_ratio: string;
   quality: string;
   count: number;
-  prompt_pack_mode?: 'five_image_prompts';
+  prompt_pack_mode?: 'stepped_image_prompts' | 'five_image_prompts';
+  prompt_pack_stage?: 'phase1_options' | 'phase2_prompts';
+  selected_option_id?: string;
+  selected_option_title?: string;
+  selected_option_summary?: string;
 }
 
 export interface ComposerReference {

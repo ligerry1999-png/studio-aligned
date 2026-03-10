@@ -1566,7 +1566,7 @@ export function ComposerDock({
                     px: 1.1,
                   }}
                 >
-                  5条生图词
+                  分步生图词
                 </Button>
               ) : null}
               <IconButton
@@ -1654,7 +1654,7 @@ export function ComposerDock({
             </Typography>
           ) : mode === 'text' && textPromptPackEnabled ? (
             <Typography variant="caption" sx={{ color: '#7a6b5d', fontWeight: 600 }}>
-              已开启 5 条生图提示词结构化输出
+              已开启分步生图词：先返回3个方案，再生成3条可生图提示词
             </Typography>
           ) : null}
         </Stack>
